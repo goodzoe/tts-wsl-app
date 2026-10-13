@@ -4,6 +4,8 @@ import tkinter.filedialog as fd
 import requests
 import threading
 import os
+import platform
+import subprocess
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
@@ -14,10 +16,8 @@ class TTSApp(ctk.CTk):
         self.title("TTS LatAm - Panel de Control")
         self.geometry("700x650")
         
-        # Eliminar bordes clasicos de windows si se desea un look mas moderno
-        # self.overrideredirect(True) # Opcional, pero quita la barra de titulo nativa
-        
         self.api_url = "http://127.0.0.1:8000"
+        self.downloaded_audio = "resultado.wav"
         
         # Titulo Principal Moderno
         self.frame_top = ctk.CTkFrame(self, fg_color="transparent")
@@ -66,7 +66,7 @@ class TTSApp(ctk.CTk):
         self.slider_topk.set(50)
         self.slider_topk.grid(row=3, column=1, padx=15, pady=(5, 15), sticky="ew")
         
-        self.frame_params.grid_columnconfigure(1, weight=1) # Make sliders expand
+        self.frame_params.grid_columnconfigure(1, weight=1)
 
         # --- SECCION 3: TEXTO Y GENERACION ---
         self.lbl_text = ctk.CTkLabel(self, text="Texto a generar:", font=("Helvetica", 16, "bold"))
@@ -87,10 +87,10 @@ class TTSApp(ctk.CTk):
         self.status_lbl = ctk.CTkLabel(self.frame_bottom, text="Estado: Listo", text_color="#10b981", font=("Helvetica", 12, "bold"))
         self.status_lbl.pack(side="right")
         
-        # Mini Reproductor (Oculto por defecto hasta que haya audio)
+        # Mini Reproductor
         self.frame_player = ctk.CTkFrame(self, corner_radius=10, fg_color="#1f2937")
         self.frame_player.pack(fill="x", padx=20, pady=(0, 20))
-        self.frame_player.pack_forget() # Ocultar inicialmente
+        self.frame_player.pack_forget()
         
         self.btn_play = ctk.CTkButton(self.frame_player, text="🔊 Reproducir Resultado", fg_color="#3b82f6", hover_color="#2563eb", command=self.play_audio)
         self.btn_play.pack(pady=10)
@@ -130,8 +130,7 @@ class TTSApp(ctk.CTk):
         
         self.btn_generate.configure(state="disabled", text="⏳ Generando...")
         self.status_lbl.configure(text="Procesando modelo...", text_color="#f59e0b")
-        # Calculo mockeado de ETA: ~2 segs por cada 100 caracteres + 5 seg overhead
-        eta_segs = max(5, int((len(text) / 100) * 2) + 5)
+        eta_segs = max(5, int((len(text) / 100) * 2))
         self.lbl_eta.configure(text=f"ETA: ~{eta_segs}s")
         self.frame_player.pack_forget()
         
@@ -147,8 +146,14 @@ class TTSApp(ctk.CTk):
             }
             resp = requests.post(f"{self.api_url}/tts", json=payload)
             if resp.status_code == 200:
+                # Descargar el audio
+                audio_resp = requests.get(f"{self.api_url}/download")
+                if audio_resp.status_code == 200:
+                    with open(self.downloaded_audio, "wb") as f:
+                        f.write(audio_resp.content)
+                
                 self.status_lbl.configure(text="Generación Completada", text_color="#10b981")
-                self.frame_player.pack(fill="x", padx=20, pady=(0, 20)) # Mostrar reproductor
+                self.frame_player.pack(fill="x", padx=20, pady=(0, 20))
             else:
                 self.status_lbl.configure(text="Error de generación", text_color="#ef4444")
         except Exception as e:
@@ -158,10 +163,28 @@ class TTSApp(ctk.CTk):
             self.lbl_eta.configure(text="ETA: --")
 
     def play_audio(self):
-        # Aqui conectariamos con pygame/pydub para reproducir el wav retornado
-        # Por ahora simulamos que reproduce
+        if not os.path.exists(self.downloaded_audio):
+            self.status_lbl.configure(text="Archivo no encontrado", text_color="#ef4444")
+            return
+            
         self.btn_play.configure(text="⏸ Reproduciendo...", fg_color="#10b981")
-        self.after(3000, lambda: self.btn_play.configure(text="🔊 Reproducir Resultado", fg_color="#3b82f6"))
+        
+        # Reproducir nativamente
+        def _play():
+            try:
+                if platform.system() == "Windows":
+                    import winsound
+                    winsound.PlaySound(self.downloaded_audio, winsound.SND_FILENAME)
+                elif platform.system() == "Darwin": # macOS
+                    subprocess.run(["afplay", self.downloaded_audio])
+                else: # Linux
+                    subprocess.run(["aplay", self.downloaded_audio])
+            except Exception as e:
+                print("Error reproduciendo audio:", e)
+            finally:
+                self.btn_play.configure(text="🔊 Reproducir Resultado", fg_color="#3b82f6")
+                
+        threading.Thread(target=_play).start()
 
 if __name__ == "__main__":
     app = TTSApp()
