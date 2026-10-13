@@ -23,7 +23,7 @@ function createPlayButton() {
         btn.disabled = true;
 
         try {
-            const response = await fetch("http://127.0.0.1:8000/tts", {
+            const response = await fetch("http://localhost:8000/tts", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ text: text, speed: 1.0, temperature: 0.7 })
