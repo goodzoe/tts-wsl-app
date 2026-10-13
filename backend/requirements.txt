@@ -2,5 +2,11 @@ fastapi
 uvicorn
 python-multipart
 pydantic
-torch
-transformers
+requests
+huggingface-hub
+# llama-cpp-python se debe compilar con soporte CUDA en Windows/WSL
+# pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
+llama-cpp-python
+soundfile
+torchaudio
+encodec
