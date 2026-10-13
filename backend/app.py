@@ -4,16 +4,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from fastapi.responses import FileResponse
 import uvicorn
-# Importaciones para el modelo (comentadas hasta instalar dependencias)
-# import torch
-# from transformers import pipeline
+import subprocess
 
 app = FastAPI(title="LatAm TTS Backend (sirekist98/spanish_conversational_tts)")
 
-# Permitir a la extensión de Brave comunicarse con el backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # En producción se limita a wtr-lab.com
+    allow_origins=["*"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -22,7 +19,7 @@ app.add_middleware(
 class TTSRequest(BaseModel):
     text: str
     speed: float = 1.0
-    temperature: float = 0.7 # Controla la expresividad/emoción
+    temperature: float = 0.7 
 
 print("Iniciando motor TTS: sirekist98/spanish_conversational_tts...")
 print("Límite VRAM configurado: < 5GB")
@@ -34,11 +31,7 @@ async def generate_tts(request: TTSRequest):
     
     print(f"Generando audio para texto ({len(request.text)} chars) | Vel: {request.speed} | Temp: {request.temperature}")
     
-    # Aquí irá la lógica de inferencia zero-shot.
-    # Se cargará el audio de reference_audio/base_voice.mp3
-    # Y se aplicará el texto.
-    
-    # Placeholder de respuesta
+    # Placeholder de respuesta hasta que se integre la libreria final del TTS
     return {"status": "success", "message": "Audio generado en backend local"}
 
 @app.post("/upload_reference")
