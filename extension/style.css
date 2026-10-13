@@ -1,0 +1,26 @@
+.tts-floating-btn {
+    position: fixed;
+    bottom: 30px;
+    right: 30px;
+    z-index: 999999;
+    background-color: #2563eb;
+    color: white;
+    padding: 14px 28px;
+    border-radius: 50px;
+    border: none;
+    font-size: 16px;
+    font-weight: bold;
+    cursor: pointer;
+    box-shadow: 0 10px 15px -3px rgba(0,0,0,0.3);
+    transition: all 0.3s ease;
+    font-family: Arial, sans-serif;
+}
+.tts-floating-btn:hover {
+    background-color: #1d4ed8;
+    transform: translateY(-3px);
+}
+.tts-floating-btn:disabled {
+    background-color: #6b7280;
+    cursor: not-allowed;
+    transform: none;
+}
