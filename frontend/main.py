@@ -15,7 +15,6 @@ import customtkinter as ctk
 if platform.system() == "Linux" and os.path.exists("/mnt/wslg/PulseServer"):
     os.environ.setdefault("PULSE_SERVER", "unix:/mnt/wslg/PulseServer")
     os.environ.setdefault("SDL_AUDIODRIVER", "pulseaudio")
-    # Pre-cargar libpulse empaquetado con pygame si no está en el sistema
     site_pkgs = [p for p in sys.path if "site-packages" in p]
     for sp in site_pkgs:
         libs_dir = os.path.join(sp, "pygame.libs")
@@ -46,6 +45,10 @@ import pygame
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_REF_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "backend", "reference_audio"))
+DEFAULT_REF_FILE = os.path.join(DEFAULT_REF_DIR, "base_voice.mp3")
+
 
 def format_time(seconds: float) -> str:
     seconds = max(0, int(seconds))
@@ -62,7 +65,8 @@ class TTSApp(ctk.CTk):
         self.minsize(680, 660)
 
         self.api_url = "http://127.0.0.1:8000"
-        self.downloaded_audio = os.path.abspath("resultado.wav")
+        self.downloaded_audio = os.path.join(BASE_DIR, "resultado.wav")
+        self.reference_audio_path = DEFAULT_REF_FILE
 
         # Estado del reproductor de audio
         self.mixer_ready = False
@@ -74,6 +78,8 @@ class TTSApp(ctk.CTk):
         self.play_start_wall = 0.0
         self.play_offset = 0.0
         self.user_dragging_seek = False
+        self.is_generating = False
+        self._status_poll_inflight = False
 
         self._init_audio_mixer()
 
@@ -112,18 +118,24 @@ class TTSApp(ctk.CTk):
         )
         self.lbl_voice_title.pack(anchor="w", padx=16, pady=(12, 4))
 
+        default_label = (
+            self.reference_audio_path
+            if os.path.exists(self.reference_audio_path)
+            else "base_voice.mp3 (por defecto)"
+        )
         self.lbl_voice = ctk.CTkLabel(
             self.frame_voice,
-            text="Usando voz base por defecto (base_voice.mp3)",
-            text_color="#9ca3af",
+            text=default_label,
+            text_color="#e5e7eb",
+            font=("Consolas", 11),
         )
         self.lbl_voice.pack(side="left", padx=16, pady=(0, 12))
 
         self.btn_voice = ctk.CTkButton(
             self.frame_voice,
-            text="Subir MP3/WAV",
+            text="Cambiar MP3/WAV",
             command=self.upload_voice,
-            width=130,
+            width=140,
             corner_radius=8,
         )
         self.btn_voice.pack(side="right", padx=16, pady=(0, 12))
@@ -207,7 +219,6 @@ class TTSApp(ctk.CTk):
         )
         self.frame_player.pack(fill="x", padx=24, pady=(6, 18))
 
-        # Barra de progreso superior roja con punto deslizable (como en la imagen de referencia)
         self.seek_slider = ctk.CTkSlider(
             self.frame_player,
             from_=0.0,
@@ -227,11 +238,9 @@ class TTSApp(ctk.CTk):
         self.seek_slider.bind("<ButtonPress-1>", self.on_seek_press)
         self.seek_slider.bind("<ButtonRelease-1>", self.on_seek_release)
 
-        # Fila inferior de controles (Play circular, Volumen circular, Píldora de tiempo MM:SS / MM:SS)
         self.frame_controls = ctk.CTkFrame(self.frame_player, fg_color="transparent")
         self.frame_controls.pack(fill="x", padx=14, pady=(0, 10))
 
-        # Botón Play / Pause circular
         self.btn_play = ctk.CTkButton(
             self.frame_controls,
             text="▶",
@@ -246,7 +255,6 @@ class TTSApp(ctk.CTk):
         )
         self.btn_play.pack(side="left", padx=(0, 8))
 
-        # Botón Mute / Volumen circular
         self.btn_mute = ctk.CTkButton(
             self.frame_controls,
             text="🔊",
@@ -261,7 +269,6 @@ class TTSApp(ctk.CTk):
         )
         self.btn_mute.pack(side="left", padx=(0, 8))
 
-        # Píldora de tiempo "00:00 / 00:00"
         self.frame_time_pill = ctk.CTkFrame(
             self.frame_controls,
             corner_radius=18,
@@ -278,7 +285,6 @@ class TTSApp(ctk.CTk):
         )
         self.lbl_time.pack(padx=14, pady=6)
 
-        # Control de volumen compacto
         self.slider_vol = ctk.CTkSlider(
             self.frame_controls,
             from_=0.0,
@@ -294,7 +300,6 @@ class TTSApp(ctk.CTk):
         self.slider_vol.set(self.volume)
         self.slider_vol.pack(side="left", padx=6)
 
-        # Botón Guardar Audio a la derecha
         self.btn_save = ctk.CTkButton(
             self.frame_controls,
             text="⬇ Guardar",
@@ -308,9 +313,6 @@ class TTSApp(ctk.CTk):
         )
         self.btn_save.pack(side="right")
 
-        self.is_generating = False
-
-        # Si ya existe un resultado previo, cargarlo listo para reproducir
         if os.path.exists(self.downloaded_audio):
             self._load_audio_metadata(self.downloaded_audio)
 
@@ -319,16 +321,16 @@ class TTSApp(ctk.CTk):
 
     def _init_audio_mixer(self):
         try:
-            pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=1024)
+            pygame.mixer.init(frequency=24000, size=-16, channels=1, buffer=1024)
             pygame.mixer.music.set_volume(self.volume)
             self.mixer_ready = True
         except Exception as e:
             print(f"Advertencia: No se pudo iniciar pygame.mixer ({e})")
             self.mixer_ready = False
 
-    def _load_audio_metadata(self, filepath: str):
+    def _load_audio_metadata(self, filepath: str) -> bool:
         if not self.mixer_ready or not os.path.exists(filepath):
-            return
+            return False
         try:
             snd = pygame.mixer.Sound(filepath)
             self.audio_duration = max(0.1, float(snd.get_length()))
@@ -341,8 +343,10 @@ class TTSApp(ctk.CTk):
             self.lbl_time.configure(
                 text=f"00:00 / {format_time(self.audio_duration)}"
             )
+            return True
         except Exception as e:
             print(f"Error cargando audio en el reproductor: {e}")
+            return False
 
     def toggle_play_pause(self):
         if not self.mixer_ready:
@@ -356,23 +360,21 @@ class TTSApp(ctk.CTk):
             return
 
         if self.audio_duration <= 0.1:
-            self._load_audio_metadata(self.downloaded_audio)
+            if not self._load_audio_metadata(self.downloaded_audio):
+                return
 
         try:
             if self.is_playing and not self.is_paused:
-                # Pausar
                 pygame.mixer.music.pause()
                 self.play_offset = self._get_current_pos()
                 self.is_paused = True
                 self.btn_play.configure(text="▶")
             elif self.is_playing and self.is_paused:
-                # Reanudar
                 pygame.mixer.music.unpause()
                 self.play_start_wall = time.time()
                 self.is_paused = False
                 self.btn_play.configure(text="⏸")
             else:
-                # Iniciar desde el offset actual (o desde 0 si llegó al final)
                 if self.play_offset >= self.audio_duration - 0.15:
                     self.play_offset = 0.0
                 pygame.mixer.music.load(self.downloaded_audio)
@@ -431,9 +433,7 @@ class TTSApp(ctk.CTk):
         self.user_dragging_seek = False
 
     def _get_current_pos(self) -> float:
-        if not self.is_playing:
-            return self.play_offset
-        if self.is_paused:
+        if not self.is_playing or self.is_paused:
             return self.play_offset
         elapsed = time.time() - self.play_start_wall
         return min(self.audio_duration, self.play_offset + elapsed)
@@ -441,7 +441,6 @@ class TTSApp(ctk.CTk):
     def _update_player_loop(self):
         if self.mixer_ready and self.is_playing and not self.is_paused:
             if not pygame.mixer.music.get_busy():
-                # Terminó la pista
                 self.is_playing = False
                 self.is_paused = False
                 self.play_offset = 0.0
@@ -466,7 +465,7 @@ class TTSApp(ctk.CTk):
             return
         dest = fd.asksaveasfilename(
             defaultextension=".wav",
-            filetypes=[("Audio WAV/MP3", "*.wav *.mp3")],
+            filetypes=[("Audio WAV", "*.wav")],
             initialfile="tts_generado.wav",
         )
         if dest:
@@ -474,34 +473,55 @@ class TTSApp(ctk.CTk):
             self.status_lbl.configure(text="✅ Audio guardado", text_color="#10b981")
 
     def check_backend_status(self):
+        if not self._status_poll_inflight:
+            self._status_poll_inflight = True
+            threading.Thread(target=self._poll_status_worker, daemon=True).start()
+        self.after(2000, self.check_backend_status)
+
+    def _poll_status_worker(self):
         try:
-            resp = requests.get(f"{self.api_url}/status", timeout=2)
+            resp = requests.get(f"{self.api_url}/status", timeout=8)
             if resp.status_code == 200:
                 data = resp.json()
-                state = data.get("status")
-                msg = data.get("message")
-
-                if state == "DOWNLOADING":
-                    self.status_lbl.configure(text=f"⏳ {msg}", text_color="#3b82f6")
-                    self.btn_generate.configure(state="disabled")
-                elif state == "LOADING":
-                    self.status_lbl.configure(text=f"🧠 {msg}", text_color="#f59e0b")
-                    self.btn_generate.configure(state="disabled")
-                elif state in ["READY", "SIMULATION"]:
-                    if not self.is_generating:
-                        self.status_lbl.configure(text=f"✅ {msg}", text_color="#10b981")
-                        self.btn_generate.configure(state="normal")
-                elif state == "ERROR":
-                    self.status_lbl.configure(text=f"❌ {msg}", text_color="#ef4444")
-                    self.btn_generate.configure(state="disabled")
+                self.after(0, lambda d=data: self._apply_backend_status(d))
             else:
-                self.status_lbl.configure(text="Conectando al backend...", text_color="#f59e0b")
-                self.btn_generate.configure(state="disabled")
+                if not self.is_generating:
+                    self.after(
+                        0,
+                        lambda: self.status_lbl.configure(
+                            text="Conectando al backend...", text_color="#f59e0b"
+                        ),
+                    )
         except Exception:
-            self.status_lbl.configure(text="Backend offline. Esperando...", text_color="#ef4444")
-            self.btn_generate.configure(state="disabled")
+            if not self.is_generating:
+                self.after(
+                    0,
+                    lambda: self.status_lbl.configure(
+                        text="Backend offline. Esperando...", text_color="#ef4444"
+                    ),
+                )
+        finally:
+            self._status_poll_inflight = False
 
-        self.after(2000, self.check_backend_status)
+    def _apply_backend_status(self, data: dict):
+        state = data.get("status")
+        msg = data.get("message", "")
+
+        if self.is_generating or state == "GENERATING":
+            self.status_lbl.configure(text="⏳ Generando voz con IA...", text_color="#f59e0b")
+            self.btn_generate.configure(state="disabled")
+        elif state == "DOWNLOADING":
+            self.status_lbl.configure(text=f"⏳ {msg}", text_color="#3b82f6")
+            self.btn_generate.configure(state="disabled")
+        elif state == "LOADING":
+            self.status_lbl.configure(text=f"🧠 {msg}", text_color="#f59e0b")
+            self.btn_generate.configure(state="disabled")
+        elif state in ["READY", "SIMULATION"]:
+            self.status_lbl.configure(text=f"✅ {msg}", text_color="#10b981")
+            self.btn_generate.configure(state="normal")
+        elif state == "ERROR":
+            self.status_lbl.configure(text=f"❌ {msg}", text_color="#ef4444")
+            self.btn_generate.configure(state="disabled")
 
     def update_speed_lbl(self, val):
         self.lbl_speed.configure(text=f"Velocidad: {val:.1f}x")
@@ -513,18 +533,28 @@ class TTSApp(ctk.CTk):
         self.lbl_topk.configure(text=f"Top K: {int(val)}")
 
     def upload_voice(self):
-        filepath = fd.askopenfilename(filetypes=[("Audio Files", "*.mp3 *.wav")])
+        init_dir = DEFAULT_REF_DIR if os.path.isdir(DEFAULT_REF_DIR) else BASE_DIR
+        filepath = fd.askopenfilename(
+            initialdir=init_dir,
+            filetypes=[("Audio Files", "*.mp3 *.wav")],
+        )
         if filepath:
-            self.lbl_voice.configure(text=f"{os.path.basename(filepath)}", text_color="white")
+            self.reference_audio_path = filepath
+            self.lbl_voice.configure(text=filepath, text_color="#e5e7eb")
             threading.Thread(target=self._upload_voice_thread, args=(filepath,), daemon=True).start()
 
     def _upload_voice_thread(self, filepath):
         try:
             with open(filepath, "rb") as f:
                 files = {"file": f}
-                resp = requests.post(f"{self.api_url}/upload_reference", files=files)
+                resp = requests.post(f"{self.api_url}/upload_reference", files=files, timeout=15)
             if resp.status_code == 200:
-                self.status_lbl.configure(text="✅ Voz de referencia actualizada", text_color="#10b981")
+                self.after(
+                    0,
+                    lambda: self.status_lbl.configure(
+                        text="✅ Voz de referencia actualizada", text_color="#10b981"
+                    ),
+                )
         except Exception as e:
             print("Error subiendo voz:", e)
 
@@ -535,8 +565,8 @@ class TTSApp(ctk.CTk):
 
         self.is_generating = True
         self.btn_generate.configure(state="disabled", text="⏳ Generando...")
-        self.status_lbl.configure(text="Generando audio...", text_color="#f59e0b")
-        eta_segs = max(3, int((len(text) / 100) * 2))
+        self.status_lbl.configure(text="⏳ Generando voz con IA...", text_color="#f59e0b")
+        eta_segs = max(4, int((len(text) / 25) * 2))
         self.lbl_eta.configure(text=f"ETA: ~{eta_segs}s")
 
         threading.Thread(target=self._generate_thread, args=(text,), daemon=True).start()
@@ -549,32 +579,53 @@ class TTSApp(ctk.CTk):
                 "temperature": self.slider_temp.get(),
                 "top_k": int(self.slider_topk.get()),
             }
-            resp = requests.post(f"{self.api_url}/tts", json=payload)
+            resp = requests.post(f"{self.api_url}/tts", json=payload, timeout=300)
             if resp.status_code == 200:
-                audio_resp = requests.get(f"{self.api_url}/download")
+                audio_resp = requests.get(f"{self.api_url}/download", timeout=30)
                 if audio_resp.status_code == 200:
                     if self.mixer_ready and self.is_playing:
                         pygame.mixer.music.stop()
                     with open(self.downloaded_audio, "wb") as f:
                         f.write(audio_resp.content)
-                    self.after(0, lambda: self._on_audio_ready())
-                self.status_lbl.configure(text="✅ Audio Generado", text_color="#10b981")
+                    self.after(0, self._on_audio_ready)
+                self.after(
+                    0,
+                    lambda: self.status_lbl.configure(
+                        text="✅ Audio Generado y Reproduciendo", text_color="#10b981"
+                    ),
+                )
             else:
                 try:
                     err_msg = resp.json().get("detail", "Error de generación")
                 except Exception:
                     err_msg = "Error de generación"
-                self.status_lbl.configure(text=f"❌ {err_msg}", text_color="#ef4444")
-        except Exception:
-            self.status_lbl.configure(text="❌ Error de red con el backend", text_color="#ef4444")
+                self.after(
+                    0,
+                    lambda m=err_msg: self.status_lbl.configure(
+                        text=f"❌ {m}", text_color="#ef4444"
+                    ),
+                )
+        except Exception as e:
+            print("Error en generación:", e)
+            self.after(
+                0,
+                lambda: self.status_lbl.configure(
+                    text="❌ Error comunicando con el backend", text_color="#ef4444"
+                ),
+            )
         finally:
             self.is_generating = False
-            self.btn_generate.configure(state="normal", text="▶ Generar Audio")
-            self.lbl_eta.configure(text="ETA: --")
+            self.after(
+                0,
+                lambda: (
+                    self.btn_generate.configure(state="normal", text="▶ Generar Audio"),
+                    self.lbl_eta.configure(text="ETA: --"),
+                ),
+            )
 
     def _on_audio_ready(self):
-        self._load_audio_metadata(self.downloaded_audio)
-        self.toggle_play_pause()
+        if self._load_audio_metadata(self.downloaded_audio):
+            self.toggle_play_pause()
 
 
 if __name__ == "__main__":
