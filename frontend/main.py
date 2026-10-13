@@ -19,7 +19,6 @@ class TTSApp(ctk.CTk):
         self.api_url = "http://127.0.0.1:8000"
         self.downloaded_audio = "resultado.wav"
         
-        # Titulo Principal Moderno
         self.frame_top = ctk.CTkFrame(self, fg_color="transparent")
         self.frame_top.pack(fill="x", pady=15, padx=20)
         
@@ -74,7 +73,6 @@ class TTSApp(ctk.CTk):
         self.textbox = ctk.CTkTextbox(self, height=100, corner_radius=10)
         self.textbox.pack(pady=5, padx=20, fill="both", expand=True)
         
-        # Contenedor inferior: Boton + Mini Reproductor + Estado
         self.frame_bottom = ctk.CTkFrame(self, fg_color="transparent")
         self.frame_bottom.pack(fill="x", padx=20, pady=15)
         
@@ -84,16 +82,48 @@ class TTSApp(ctk.CTk):
         self.lbl_eta = ctk.CTkLabel(self.frame_bottom, text="ETA: --", text_color="gray")
         self.lbl_eta.pack(side="left", padx=10)
 
-        self.status_lbl = ctk.CTkLabel(self.frame_bottom, text="Estado: Listo", text_color="#10b981", font=("Helvetica", 12, "bold"))
+        self.status_lbl = ctk.CTkLabel(self.frame_bottom, text="Conectando al backend...", text_color="#f59e0b", font=("Helvetica", 12, "bold"))
         self.status_lbl.pack(side="right")
         
-        # Mini Reproductor
         self.frame_player = ctk.CTkFrame(self, corner_radius=10, fg_color="#1f2937")
         self.frame_player.pack(fill="x", padx=20, pady=(0, 20))
         self.frame_player.pack_forget()
         
         self.btn_play = ctk.CTkButton(self.frame_player, text="🔊 Reproducir Resultado", fg_color="#3b82f6", hover_color="#2563eb", command=self.play_audio)
         self.btn_play.pack(pady=10)
+        
+        self.is_generating = False
+        self.check_backend_status()
+
+    def check_backend_status(self):
+        try:
+            resp = requests.get(f"{self.api_url}/status", timeout=2)
+            if resp.status_code == 200:
+                data = resp.json()
+                state = data.get("status")
+                msg = data.get("message")
+                
+                if state == "DOWNLOADING":
+                    self.status_lbl.configure(text=f"⏳ {msg}", text_color="#3b82f6")
+                    self.btn_generate.configure(state="disabled")
+                elif state == "LOADING":
+                    self.status_lbl.configure(text=f"🧠 {msg}", text_color="#f59e0b")
+                    self.btn_generate.configure(state="disabled")
+                elif state in ["READY", "SIMULATION"]:
+                    if not self.is_generating:
+                        self.status_lbl.configure(text=f"✅ {msg}", text_color="#10b981")
+                        self.btn_generate.configure(state="normal")
+                elif state == "ERROR":
+                    self.status_lbl.configure(text=f"❌ {msg}", text_color="#ef4444")
+                    self.btn_generate.configure(state="disabled")
+            else:
+                self.status_lbl.configure(text="Conectando al backend...", text_color="#f59e0b")
+                self.btn_generate.configure(state="disabled")
+        except Exception as e:
+            self.status_lbl.configure(text="Backend offline. Esperando...", text_color="#ef4444")
+            self.btn_generate.configure(state="disabled")
+            
+        self.after(2000, self.check_backend_status)
 
     def update_speed_lbl(self, val):
         self.lbl_speed.configure(text=f"Velocidad: {val:.1f}x")
@@ -108,7 +138,6 @@ class TTSApp(ctk.CTk):
         filepath = fd.askopenfilename(filetypes=[("Audio Files", "*.mp3 *.wav")])
         if filepath:
             self.lbl_voice.configure(text=f"{os.path.basename(filepath)}", text_color="white")
-            self.status_lbl.configure(text="Subiendo voz...", text_color="#f59e0b")
             threading.Thread(target=self._upload_voice_thread, args=(filepath,)).start()
 
     def _upload_voice_thread(self, filepath):
@@ -117,19 +146,18 @@ class TTSApp(ctk.CTk):
                 files = {'file': f}
                 resp = requests.post(f"{self.api_url}/upload_reference", files=files)
             if resp.status_code == 200:
-                self.status_lbl.configure(text="Voz lista", text_color="#10b981")
-            else:
-                self.status_lbl.configure(text="Error al subir", text_color="#ef4444")
+                print("Voz subida.")
         except Exception as e:
-            self.status_lbl.configure(text="Backend offline", text_color="#ef4444")
+            print("Error subiendo voz:", e)
 
     def generate_audio(self):
         text = self.textbox.get("1.0", "end-1c")
         if not text.strip():
             return
         
+        self.is_generating = True
         self.btn_generate.configure(state="disabled", text="⏳ Generando...")
-        self.status_lbl.configure(text="Procesando modelo...", text_color="#f59e0b")
+        self.status_lbl.configure(text="Generando audio...", text_color="#f59e0b")
         eta_segs = max(5, int((len(text) / 100) * 2))
         self.lbl_eta.configure(text=f"ETA: ~{eta_segs}s")
         self.frame_player.pack_forget()
@@ -146,41 +174,43 @@ class TTSApp(ctk.CTk):
             }
             resp = requests.post(f"{self.api_url}/tts", json=payload)
             if resp.status_code == 200:
-                # Descargar el audio
                 audio_resp = requests.get(f"{self.api_url}/download")
                 if audio_resp.status_code == 200:
                     with open(self.downloaded_audio, "wb") as f:
                         f.write(audio_resp.content)
                 
-                self.status_lbl.configure(text="Generación Completada", text_color="#10b981")
+                self.status_lbl.configure(text="✅ Audio Generado", text_color="#10b981")
                 self.frame_player.pack(fill="x", padx=20, pady=(0, 20))
             else:
-                self.status_lbl.configure(text="Error de generación", text_color="#ef4444")
+                try:
+                    err_msg = resp.json().get("detail", "Error de generación")
+                except:
+                    err_msg = "Error de generación"
+                self.status_lbl.configure(text=f"❌ {err_msg}", text_color="#ef4444")
         except Exception as e:
-            self.status_lbl.configure(text="Error de conexión al backend", text_color="#ef4444")
+            self.status_lbl.configure(text="❌ Error de red", text_color="#ef4444")
         finally:
+            self.is_generating = False
             self.btn_generate.configure(state="normal", text="▶ Generar Audio")
             self.lbl_eta.configure(text="ETA: --")
 
     def play_audio(self):
         if not os.path.exists(self.downloaded_audio):
-            self.status_lbl.configure(text="Archivo no encontrado", text_color="#ef4444")
             return
             
         self.btn_play.configure(text="⏸ Reproduciendo...", fg_color="#10b981")
         
-        # Reproducir nativamente
         def _play():
             try:
                 if platform.system() == "Windows":
                     import winsound
                     winsound.PlaySound(self.downloaded_audio, winsound.SND_FILENAME)
-                elif platform.system() == "Darwin": # macOS
+                elif platform.system() == "Darwin":
                     subprocess.run(["afplay", self.downloaded_audio])
-                else: # Linux
+                else:
                     subprocess.run(["aplay", self.downloaded_audio])
             except Exception as e:
-                print("Error reproduciendo audio:", e)
+                print("Error reproduciendo:", e)
             finally:
                 self.btn_play.configure(text="🔊 Reproducir Resultado", fg_color="#3b82f6")
                 

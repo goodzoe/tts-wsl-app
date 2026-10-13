@@ -1,6 +1,6 @@
 import os
 import time
-import subprocess
+import threading
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -17,7 +17,7 @@ try:
     AI_AVAILABLE = True
 except ImportError:
     AI_AVAILABLE = False
-    print("⚠️  [ADVERTENCIA] Faltan librerías de IA (llama_cpp, torch o encodec). Ejecutando en modo SIMULACIÓN.")
+    print("⚠️  [ADVERTENCIA] Faltan librerías de IA. Ejecutando en modo SIMULACIÓN.")
 
 app = FastAPI(title="LatAm TTS Backend (GGUF Q4)")
 
@@ -42,49 +42,66 @@ MODEL_PATH = os.path.join("models", MODEL_FILE)
 llm = None
 vocoder = None
 
-def load_models():
-    global llm, vocoder
+backend_state = {
+    "status": "INITIALIZING",
+    "message": "Iniciando servidor backend..."
+}
+
+def load_models_background():
+    global llm, vocoder, backend_state
     if not AI_AVAILABLE:
+        backend_state["status"] = "SIMULATION"
+        backend_state["message"] = "Modo simulación activo"
         return
     
-    os.makedirs("models", exist_ok=True)
-    
-    print("⏳ Verificando/Descargando modelo GGUF Q4_K_M (Aprox 1.8GB)...")
-    if not os.path.exists(MODEL_PATH):
-        hf_hub_download(repo_id=MODEL_REPO, filename=MODEL_FILE, local_dir="models")
-    
-    print("🧠 Cargando modelo en VRAM con llama.cpp...")
-    llm = Llama(
-        model_path=MODEL_PATH,
-        n_gpu_layers=-1, 
-        n_ctx=4096,
-        verbose=False
-    )
-    
-    print("🎵 Cargando Vocoder (Encodec) para decodificar audio...")
-    vocoder = EncodecModel.encodec_model_24khz()
-    vocoder.set_target_bandwidth(6.0)
-    
-    print("✅ ¡Modelos cargados exitosamente! Consumo estimado VRAM: < 2.5 GB")
+    try:
+        os.makedirs("models", exist_ok=True)
+        
+        if not os.path.exists(MODEL_PATH):
+            backend_state["status"] = "DOWNLOADING"
+            backend_state["message"] = "Descargando modelo GGUF (1.8GB)..."
+            hf_hub_download(repo_id=MODEL_REPO, filename=MODEL_FILE, local_dir="models")
+        
+        backend_state["status"] = "LOADING"
+        backend_state["message"] = "Cargando modelo en VRAM (< 2.5GB)..."
+        llm = Llama(
+            model_path=MODEL_PATH,
+            n_gpu_layers=-1, 
+            n_ctx=4096,
+            verbose=False
+        )
+        
+        backend_state["status"] = "READY"
+        backend_state["message"] = "Motor TTS Zero-Shot Listo"
+    except Exception as e:
+        backend_state["status"] = "ERROR"
+        backend_state["message"] = f"Error: {str(e)}"
+        print(f"Error al cargar modelos: {e}")
 
-load_models()
+@app.on_event("startup")
+def startup_event():
+    threading.Thread(target=load_models_background, daemon=True).start()
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "Backend TTS GGUF corriendo. Endpoint activo: POST /tts"}
+    return {"status": "ok", "message": "Backend activo. Endpoint /status disponible."}
+
+@app.get("/status")
+async def get_status():
+    return backend_state
 
 @app.post("/tts")
 async def generate_tts(request: TTSRequest):
+    if backend_state["status"] not in ["READY", "SIMULATION"]:
+        raise HTTPException(status_code=503, detail="El modelo aún se está descargando o inicializando.")
+
     if not request.text:
         raise HTTPException(status_code=400, detail="Texto vacío")
-    
-    print(f"Generando audio | Texto: {len(request.text)} chars | Temp: {request.temperature} | Top K: {request.top_k}")
     
     ref_audio_path = "reference_audio/base_voice.mp3"
     out_audio_path = "output_audio.wav"
     
     if not AI_AVAILABLE or llm is None:
-        print("Ejecutando en modo simulación...")
         eta_segs = max(5, int((len(request.text) / 100) * 2))
         time.sleep(eta_segs)
         if not os.path.exists(out_audio_path) and os.path.exists(ref_audio_path):
@@ -94,11 +111,10 @@ async def generate_tts(request: TTSRequest):
     
     try:
         if not os.path.exists(ref_audio_path):
-            raise HTTPException(status_code=400, detail="Falta audio de referencia para clonación Zero-Shot")
+            raise HTTPException(status_code=400, detail="Sube un audio de referencia (Zero-Shot) en la interfaz primero.")
             
         prompt = f"<|start_header_id|>system<|end_header_id|>\nGenera el audio hablado para el siguiente texto manteniendo la voz de referencia.<|eot_id|><|start_header_id|>user<|end_header_id|>\nTexto: {request.text}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n<|audio_start|>"
         
-        print("🧠 Inferencia Llama en progreso...")
         output = llm(
             prompt,
             max_tokens=2048,
@@ -107,14 +123,12 @@ async def generate_tts(request: TTSRequest):
             stop=["<|audio_end|>", "<|eot_id|>"]
         )
         
-        print("🎵 Decodificando con Vocoder...")
+        # Simulated vocoder step
         import shutil
         shutil.copy(ref_audio_path, out_audio_path)
         
-        print("✅ Generación completada.")
         return {"status": "success", "message": "Audio generado correctamente", "audio_url": "/download"}
     except Exception as e:
-        print(f"Error en inferencia: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/download")
@@ -129,7 +143,7 @@ async def upload_reference(file: UploadFile = File(...)):
     file_location = "reference_audio/base_voice.mp3"
     with open(file_location, "wb+") as f:
         f.write(file.file.read())
-    return {"info": f"Voz base guardada con éxito en {file_location}"}
+    return {"info": f"Voz base guardada con éxito"}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

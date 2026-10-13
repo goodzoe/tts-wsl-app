@@ -9,14 +9,12 @@ function createPlayButton() {
     btn.className = "tts-floating-btn";
     
     btn.addEventListener("click", async () => {
-        // En wtr-lab, el texto suele estar bajo ciertas clases. Ajustar si el DOM cambia.
         const textElement = document.querySelector(".chapter-content") || document.querySelector(".read-container") || document.querySelector("body");
         if (!textElement) {
             alert("No se encontró el texto del capítulo.");
             return;
         }
         
-        // Limpiamos un poco el texto de saltos de línea excesivos
         const text = textElement.innerText.replace(/\n{3,}/g, '\n\n');
         
         btn.innerText = "⏳ Generando Voz...";
@@ -26,12 +24,19 @@ function createPlayButton() {
             const response = await fetch("http://localhost:8000/tts", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ text: text, speed: 1.0, temperature: 0.7 })
+                body: JSON.stringify({ text: text, speed: 1.0, temperature: 0.7, top_k: 50 })
             });
 
-            if (!response.ok) throw new Error("El backend no responde");
+            if (response.status === 503) {
+                alert("El modelo de Inteligencia Artificial se está descargando en el servidor local. Por favor, abre el Panel de Control para ver el progreso del ETA.");
+                throw new Error("Modelo descargándose");
+            } else if (response.status === 400) {
+                alert("Por favor sube primero un audio de referencia en el Panel de Control para poder usar la clonación Zero-Shot.");
+                throw new Error("Falta audio de referencia");
+            } else if (!response.ok) {
+                throw new Error("Error del backend");
+            }
 
-            // Simulación de lectura terminada (hasta conectar el audio blob real)
             btn.innerText = "▶ Audio Generado";
             setTimeout(() => {
                 btn.innerText = "🔊 Escuchar de nuevo";
@@ -40,7 +45,9 @@ function createPlayButton() {
 
         } catch (error) {
             console.error(error);
-            alert("Error conectando con el Backend FastAPI en localhost:8000. ¿Está encendido?");
+            if (error.message !== "Modelo descargándose" && error.message !== "Falta audio de referencia") {
+                alert("Error conectando con el Backend en localhost:8000. ¿Está encendido?");
+            }
             btn.innerText = "🔊 Escuchar con TTS Local";
             btn.disabled = false;
         }
@@ -49,7 +56,6 @@ function createPlayButton() {
     document.body.appendChild(btn);
 }
 
-// Ejecutar cuando el DOM esté listo
 if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", createPlayButton);
 } else {
