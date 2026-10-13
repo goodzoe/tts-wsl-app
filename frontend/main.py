@@ -1,3 +1,4 @@
+import tkinter
 import customtkinter as ctk
 import tkinter.filedialog as fd
 import requests
