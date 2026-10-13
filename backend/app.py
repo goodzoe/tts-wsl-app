@@ -58,9 +58,10 @@ def encode_reference_audio_to_tokens(audio_path: str, max_seconds: float = 3.0) 
         if cached_ref_tokens is not None and cached_ref_mtime == mtime:
             return cached_ref_tokens
 
-        waveform, sr = torchaudio.load(audio_path)
-        if waveform.shape[0] > 1:
-            waveform = waveform.mean(dim=0, keepdim=True)
+        data, sr = sf.read(audio_path, dtype="float32")
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+        waveform = torch.from_numpy(data).unsqueeze(0)
         if sr != 24000:
             waveform = torchaudio.functional.resample(waveform, sr, 24000)
         max_samples = int(24000 * max_seconds)
@@ -216,8 +217,8 @@ def generate_tts(request: TTSRequest):
         backend_state["message"] = "Generando voz con IA..."
         try:
             if not AI_AVAILABLE or llm is None or snac_model is None:
-                waveform, sr = torchaudio.load(DEFAULT_REF_AUDIO)
-                sf.write(OUT_AUDIO_PATH, waveform.t().numpy(), sr, subtype="PCM_16")
+                data, sr = sf.read(DEFAULT_REF_AUDIO, dtype="float32")
+                sf.write(OUT_AUDIO_PATH, data, sr, subtype="PCM_16")
                 return {"status": "success", "message": "Audio generado (Simulado)", "audio_url": "/download"}
 
             print(f"🧠 Sintetizando voz para ({len(text)} chars): {text[:60]}...", flush=True)
