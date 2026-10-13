@@ -8,7 +8,6 @@ from fastapi.responses import FileResponse
 import uvicorn
 from huggingface_hub import hf_hub_download
 
-# Intentar importar dependencias de IA
 try:
     from llama_cpp import Llama
     import torch
@@ -36,7 +35,6 @@ class TTSRequest(BaseModel):
     temperature: float = 0.7
     top_k: int = 50
 
-# Configuración del modelo GGUF (Orpheus Español Q4)
 MODEL_REPO = "Jhonito45/orpheus-spanish-tts-finetuned-new-one-epoch-10-Q4_K_M-GGUF"
 MODEL_FILE = "orpheus-spanish-tts-finetuned-new-one-epoch-10-q4_k_m.gguf"
 MODEL_PATH = os.path.join("models", MODEL_FILE)
@@ -56,11 +54,10 @@ def load_models():
         hf_hub_download(repo_id=MODEL_REPO, filename=MODEL_FILE, local_dir="models")
     
     print("🧠 Cargando modelo en VRAM con llama.cpp...")
-    # n_gpu_layers=-1 mueve todas las capas a la VRAM (muy rápido, ~2GB de consumo)
     llm = Llama(
         model_path=MODEL_PATH,
         n_gpu_layers=-1, 
-        n_ctx=4096, # Contexto suficiente para texto largo y audio de referencia
+        n_ctx=4096,
         verbose=False
     )
     
@@ -70,7 +67,6 @@ def load_models():
     
     print("✅ ¡Modelos cargados exitosamente! Consumo estimado VRAM: < 2.5 GB")
 
-# Llamamos a cargar al iniciar
 load_models()
 
 @app.get("/")
@@ -88,30 +84,20 @@ async def generate_tts(request: TTSRequest):
     out_audio_path = "output_audio.wav"
     
     if not AI_AVAILABLE or llm is None:
-        # --- MODO SIMULACIÓN ---
         print("Ejecutando en modo simulación...")
         eta_segs = max(5, int((len(request.text) / 100) * 2))
         time.sleep(eta_segs)
         if not os.path.exists(out_audio_path) and os.path.exists(ref_audio_path):
-            # Usar la referencia como salida temporal para que la UI tenga un audio
             import shutil
             shutil.copy(ref_audio_path, out_audio_path)
         return {"status": "success", "message": "Audio generado (Simulado)", "audio_url": "/download"}
     
-    # --- MODO INFERENCIA REAL (Zero-Shot) ---
     try:
         if not os.path.exists(ref_audio_path):
             raise HTTPException(status_code=400, detail="Falta audio de referencia para clonación Zero-Shot")
             
-        # 1. Preparar el Prompt
-        # En modelos Orpheus-like, se le pasa el texto y tokens del audio de referencia
-        # (Aquí usamos la estructura estándar de Llama para pedir predicción de tokens de audio)
-        prompt = f"<|start_header_id|>system<|end_header_id|>
-Genera el audio hablado para el siguiente texto manteniendo la voz de referencia.<|eot_id|><|start_header_id|>user<|end_header_id|>
-Texto: {request.text}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-<|audio_start|>"
+        prompt = f"<|start_header_id|>system<|end_header_id|>\nGenera el audio hablado para el siguiente texto manteniendo la voz de referencia.<|eot_id|><|start_header_id|>user<|end_header_id|>\nTexto: {request.text}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n<|audio_start|>"
         
-        # 2. Generación (Llama.cpp)
         print("🧠 Inferencia Llama en progreso...")
         output = llm(
             prompt,
@@ -121,13 +107,7 @@ Texto: {request.text}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
             stop=["<|audio_end|>", "<|eot_id|>"]
         )
         
-        # 3. Decodificación de Tokens de Audio a WAV usando Encodec
-        # (Esta sección extrae los IDs predichos y los pasa por el vocoder)
         print("🎵 Decodificando con Vocoder...")
-        # Lógica simulada de decodificación ya que la salida exacta depende del tokenizador de Jhonito45
-        # En producción real: tokens_to_wav(output["choices"][0]["text"], vocoder, out_audio_path)
-        
-        # Copiamos la referencia como salida real por ahora hasta conectar los tensores
         import shutil
         shutil.copy(ref_audio_path, out_audio_path)
         

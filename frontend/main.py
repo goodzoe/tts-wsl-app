@@ -26,7 +26,7 @@ class TTSApp(ctk.CTk):
         self.lbl_title = ctk.CTkLabel(self.frame_top, text="Studio TTS", font=("Helvetica", 28, "bold"))
         self.lbl_title.pack(side="left")
         self.lbl_subtitle = ctk.CTkLabel(self.frame_top, text="Zero-Shot Engine", font=("Helvetica", 14), text_color="gray")
-        self.lbl_subtitle.pack(side="left", padx=10, side="bottom")
+        self.lbl_subtitle.pack(side="left", padx=10)
 
         # --- SECCION 1: VOZ DE REFERENCIA ---
         self.frame_voice = ctk.CTkFrame(self, corner_radius=10)
