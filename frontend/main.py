@@ -51,6 +51,13 @@ PRESETS_DIR = os.path.join(BASE_DIR, "presets")
 DEFAULT_REF_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "backend", "reference_audio"))
 DEFAULT_REF_FILE = os.path.join(DEFAULT_REF_DIR, "base_voice.mp3")
 
+MODEL_LABELS_TO_ID = {
+    "Canopy Español Multi-Voz Femenina Nativa Q4 (2.0 GB)": "canopy-es-multivoz-q4",
+    "Canopy Español Ultra-Ligero Q2_K (1.25 GB - Ahorro RAM)": "canopy-es-ultralight-q2",
+    "Orpheus Español Conversacional Q4_K_M (2.0 GB - Local)": "orpheus-es-conversacional-q4",
+}
+MODEL_ID_TO_LABEL = {v: k for k, v in MODEL_LABELS_TO_ID.items()}
+
 
 def format_time(seconds: float) -> str:
     seconds = max(0, int(seconds))
@@ -62,9 +69,9 @@ def format_time(seconds: float) -> str:
 class TTSApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Studio TTS LatAm - Zero-Shot Voice Cloning")
-        self.geometry("820x820")
-        self.minsize(760, 760)
+        self.title("Studio TTS LatAm - Gestor de Modelos & Voz Natural")
+        self.geometry("850x860")
+        self.minsize(780, 790)
 
         os.makedirs(PRESETS_DIR, exist_ok=True)
 
@@ -87,21 +94,22 @@ class TTSApp(ctk.CTk):
 
         self._init_audio_mixer()
 
-        # --- ENCABEZADO ---
+        # --- ENCABEZADO + MONITOR DE RAM EN VIVO ---
         self.frame_top = ctk.CTkFrame(self, fg_color="transparent")
-        self.frame_top.pack(fill="x", pady=(12, 6), padx=24)
+        self.frame_top.pack(fill="x", pady=(10, 4), padx=24)
 
         self.lbl_title = ctk.CTkLabel(
-            self.frame_top, text="Studio TTS", font=("Helvetica", 25, "bold")
+            self.frame_top, text="Studio TTS", font=("Helvetica", 24, "bold")
         )
         self.lbl_title.pack(side="left")
-        self.lbl_subtitle = ctk.CTkLabel(
+
+        self.lbl_ram = ctk.CTkLabel(
             self.frame_top,
-            text="Clonación Zero-Shot & Control Acústico",
-            font=("Helvetica", 13),
-            text_color="#9ca3af",
+            text="RAM Backend: -- MB | Sistema: -- GB",
+            font=("Consolas", 12, "bold"),
+            text_color="#60a5fa",
         )
-        self.lbl_subtitle.pack(side="left", padx=12, pady=(8, 0))
+        self.lbl_ram.pack(side="left", padx=16, pady=(6, 0))
 
         self.status_lbl = ctk.CTkLabel(
             self.frame_top,
@@ -111,31 +119,74 @@ class TTSApp(ctk.CTk):
         )
         self.status_lbl.pack(side="right", pady=(6, 0))
 
-        # --- SECCIÓN 1: VOZ DE REFERENCIA (PRE-CARGADA POR DEFECTO) ---
-        self.frame_voice = ctk.CTkFrame(self, corner_radius=12)
-        self.frame_voice.pack(pady=6, padx=24, fill="x")
+        # --- SECCIÓN 0: GESTOR DE MODELOS IA Y MEMORIA (CARGAR / DESCARGAR RAM/VRAM) ---
+        self.frame_models = ctk.CTkFrame(self, corner_radius=12)
+        self.frame_models.pack(pady=5, padx=24, fill="x")
 
-        self.frame_voice_header = ctk.CTkFrame(self.frame_voice, fg_color="transparent")
-        self.frame_voice_header.pack(fill="x", padx=16, pady=(10, 4))
+        self.frame_models_top = ctk.CTkFrame(self.frame_models, fg_color="transparent")
+        self.frame_models_top.pack(fill="x", padx=14, pady=(8, 4))
 
-        self.lbl_voice_title = ctk.CTkLabel(
-            self.frame_voice_header,
-            text="🎙️ Voz Base de Referencia (Femenina por defecto):",
-            font=("Helvetica", 14, "bold"),
-        )
-        self.lbl_voice_title.pack(side="left")
+        ctk.CTkLabel(
+            self.frame_models_top,
+            text="🧠 Modelo IA Activo y Gestión de RAM/VRAM:",
+            font=("Helvetica", 13, "bold"),
+        ).pack(side="left")
 
-        self.lbl_f0_badge = ctk.CTkLabel(
-            self.frame_voice_header,
-            text="F0 Ref: ~202.3 Hz (Femenina)",
-            font=("Consolas", 12, "bold"),
+        self.lbl_loaded_model = ctk.CTkLabel(
+            self.frame_models_top,
+            text="Cargado: Verificando...",
+            font=("Consolas", 11, "bold"),
             text_color="#34d399",
         )
-        self.lbl_f0_badge.pack(side="right")
+        self.lbl_loaded_model.pack(side="right")
 
-        # Selector de archivo + Ruta activa + Botones Cargar y Escuchar
+        self.frame_models_row = ctk.CTkFrame(self.frame_models, fg_color="transparent")
+        self.frame_models_row.pack(fill="x", padx=14, pady=(2, 8))
+
+        self.opt_model = ctk.CTkOptionMenu(
+            self.frame_models_row,
+            values=list(MODEL_LABELS_TO_ID.keys()),
+            width=410,
+        )
+        self.opt_model.set("Orpheus Español Conversacional Q4_K_M (2.0 GB - Local)")
+        self.opt_model.pack(side="left", padx=(0, 8))
+
+        self.btn_unload_model = ctk.CTkButton(
+            self.frame_models_row,
+            text="🧹 Liberar RAM/VRAM",
+            width=155,
+            corner_radius=8,
+            fg_color="#b91c1c",
+            hover_color="#991b1b",
+            font=("Helvetica", 12, "bold"),
+            command=self.unload_model_from_ram,
+        )
+        self.btn_unload_model.pack(side="right", padx=(6, 0))
+
+        self.btn_load_model = ctk.CTkButton(
+            self.frame_models_row,
+            text="⚡ Cargar Modelo",
+            width=145,
+            corner_radius=8,
+            fg_color="#2563eb",
+            hover_color="#1d4ed8",
+            font=("Helvetica", 12, "bold"),
+            command=self.load_selected_model,
+        )
+        self.btn_load_model.pack(side="right")
+
+        # --- SECCIÓN 1: VOZ DE REFERENCIA (PRE-CARGADA POR DEFECTO) ---
+        self.frame_voice = ctk.CTkFrame(self, corner_radius=12)
+        self.frame_voice.pack(pady=5, padx=24, fill="x")
+
         self.frame_voice_row = ctk.CTkFrame(self.frame_voice, fg_color="transparent")
-        self.frame_voice_row.pack(fill="x", padx=16, pady=(2, 6))
+        self.frame_voice_row.pack(fill="x", padx=14, pady=(8, 4))
+
+        ctk.CTkLabel(
+            self.frame_voice_row,
+            text="🎙️ Audio Base:",
+            font=("Helvetica", 13, "bold"),
+        ).pack(side="left", padx=(0, 8))
 
         ref_choices = self._scan_local_ref_files()
         self.opt_ref_file = ctk.CTkOptionMenu(
@@ -145,7 +196,7 @@ class TTSApp(ctk.CTk):
             command=self.on_select_ref_dropdown,
         )
         self.opt_ref_file.set("base_voice.mp3")
-        self.opt_ref_file.pack(side="left", padx=(0, 10))
+        self.opt_ref_file.pack(side="left", padx=(0, 8))
 
         self.btn_preview_ref = ctk.CTkButton(
             self.frame_voice_row,
@@ -156,7 +207,7 @@ class TTSApp(ctk.CTk):
             hover_color="#4b5563",
             command=self.preview_reference_voice,
         )
-        self.btn_preview_ref.pack(side="right", padx=(8, 0))
+        self.btn_preview_ref.pack(side="right", padx=(6, 0))
 
         self.btn_voice = ctk.CTkButton(
             self.frame_voice_row,
@@ -169,12 +220,12 @@ class TTSApp(ctk.CTk):
 
         self.lbl_voice = ctk.CTkLabel(
             self.frame_voice,
-            text=f"Ruta activa: {self.reference_audio_path}",
+            text=f"Ruta por defecto: {self.reference_audio_path}",
             text_color="#9ca3af",
             font=("Consolas", 11),
             anchor="w",
         )
-        self.lbl_voice.pack(fill="x", padx=16, pady=(0, 8))
+        self.lbl_voice.pack(fill="x", padx=14, pady=(0, 6))
 
         # --- SECCIÓN 2: PESTAÑAS DE PARÁMETROS + GESTIÓN DE PRESETS ---
         self.frame_presets_bar = ctk.CTkFrame(self, fg_color="transparent")
@@ -182,15 +233,15 @@ class TTSApp(ctk.CTk):
 
         ctk.CTkLabel(
             self.frame_presets_bar,
-            text="Configuración y Parámetros:",
-            font=("Helvetica", 14, "bold"),
+            text="Parámetros de Voz y Generación:",
+            font=("Helvetica", 13, "bold"),
         ).pack(side="left")
 
         self.btn_reset_params = ctk.CTkButton(
             self.frame_presets_bar,
             text="↺ Restaurar",
             width=95,
-            height=28,
+            height=26,
             corner_radius=8,
             fg_color="#374151",
             hover_color="#4b5563",
@@ -201,8 +252,8 @@ class TTSApp(ctk.CTk):
         self.btn_load_preset = ctk.CTkButton(
             self.frame_presets_bar,
             text="📂 Cargar Config",
-            width=120,
-            height=28,
+            width=115,
+            height=26,
             corner_radius=8,
             fg_color="#374151",
             hover_color="#4b5563",
@@ -213,8 +264,8 @@ class TTSApp(ctk.CTk):
         self.btn_save_preset = ctk.CTkButton(
             self.frame_presets_bar,
             text="💾 Guardar Config",
-            width=125,
-            height=28,
+            width=120,
+            height=26,
             corner_radius=8,
             fg_color="#374151",
             hover_color="#4b5563",
@@ -222,9 +273,9 @@ class TTSApp(ctk.CTk):
         )
         self.btn_save_preset.pack(side="right")
 
-        self.tabs = ctk.CTkTabview(self, height=235, corner_radius=12)
-        self.tabs.pack(fill="x", padx=24, pady=(4, 6))
-        self.tab_clone = self.tabs.add("🎙️ Clonación y Timbre Femenino")
+        self.tabs = ctk.CTkTabview(self, height=215, corner_radius=12)
+        self.tabs.pack(fill="x", padx=24, pady=(2, 4))
+        self.tab_clone = self.tabs.add("🎙️ Voz y Timbre (Natural)")
         self.tab_engine = self.tabs.add("⚙️ Motor IA y Muestreo (LLM)")
 
         self._build_clone_tab()
@@ -232,11 +283,11 @@ class TTSApp(ctk.CTk):
 
         # --- SECCIÓN 3: TEXTO A GENERAR ---
         self.lbl_text = ctk.CTkLabel(
-            self, text="Texto a convertir en voz:", font=("Helvetica", 14, "bold")
+            self, text="Texto a convertir en voz:", font=("Helvetica", 13, "bold")
         )
-        self.lbl_text.pack(anchor="w", padx=26, pady=(4, 2))
-        self.textbox = ctk.CTkTextbox(self, height=110, corner_radius=12, font=("Helvetica", 13))
-        self.textbox.pack(pady=4, padx=24, fill="both", expand=True)
+        self.lbl_text.pack(anchor="w", padx=26, pady=(2, 2))
+        self.textbox = ctk.CTkTextbox(self, height=95, corner_radius=12, font=("Helvetica", 13))
+        self.textbox.pack(pady=2, padx=24, fill="both", expand=True)
 
         # --- BOTÓN GENERAR + ETA ---
         self.frame_actions = ctk.CTkFrame(self, fg_color="transparent")
@@ -244,9 +295,9 @@ class TTSApp(ctk.CTk):
 
         self.btn_generate = ctk.CTkButton(
             self.frame_actions,
-            text="▶ Generar Audio Clonado",
+            text="▶ Generar Audio Natural",
             font=("Helvetica", 14, "bold"),
-            height=40,
+            height=38,
             corner_radius=10,
             command=self.generate_audio,
         )
@@ -264,7 +315,7 @@ class TTSApp(ctk.CTk):
         self.frame_player = ctk.CTkFrame(
             self, corner_radius=14, fg_color="#111827", border_width=1, border_color="#1f2937"
         )
-        self.frame_player.pack(fill="x", padx=24, pady=(4, 14))
+        self.frame_player.pack(fill="x", padx=24, pady=(4, 12))
 
         self.seek_slider = ctk.CTkSlider(
             self.frame_player,
@@ -281,23 +332,23 @@ class TTSApp(ctk.CTk):
             command=self.on_seek_drag,
         )
         self.seek_slider.set(0.0)
-        self.seek_slider.pack(fill="x", padx=14, pady=(12, 6))
+        self.seek_slider.pack(fill="x", padx=14, pady=(10, 4))
         self.seek_slider.bind("<ButtonPress-1>", self.on_seek_press)
         self.seek_slider.bind("<ButtonRelease-1>", self.on_seek_release)
 
         self.frame_controls = ctk.CTkFrame(self.frame_player, fg_color="transparent")
-        self.frame_controls.pack(fill="x", padx=14, pady=(0, 10))
+        self.frame_controls.pack(fill="x", padx=14, pady=(0, 8))
 
         self.btn_play = ctk.CTkButton(
             self.frame_controls,
             text="▶",
-            width=40,
-            height=40,
-            corner_radius=20,
+            width=38,
+            height=38,
+            corner_radius=19,
             fg_color="#262f3f",
             hover_color="#374151",
             text_color="#ffffff",
-            font=("Helvetica", 16, "bold"),
+            font=("Helvetica", 15, "bold"),
             command=self.toggle_play_pause,
         )
         self.btn_play.pack(side="left", padx=(0, 8))
@@ -305,13 +356,13 @@ class TTSApp(ctk.CTk):
         self.btn_mute = ctk.CTkButton(
             self.frame_controls,
             text="🔊",
-            width=40,
-            height=40,
-            corner_radius=20,
+            width=38,
+            height=38,
+            corner_radius=19,
             fg_color="#262f3f",
             hover_color="#374151",
             text_color="#ffffff",
-            font=("Helvetica", 15),
+            font=("Helvetica", 14),
             command=self.toggle_mute,
         )
         self.btn_mute.pack(side="left", padx=(0, 8))
@@ -320,7 +371,7 @@ class TTSApp(ctk.CTk):
             self.frame_controls,
             corner_radius=18,
             fg_color="#262f3f",
-            height=36,
+            height=34,
         )
         self.frame_time_pill.pack(side="left", padx=(0, 10))
 
@@ -330,7 +381,7 @@ class TTSApp(ctk.CTk):
             font=("Consolas", 13, "bold"),
             text_color="#f3f4f6",
         )
-        self.lbl_time.pack(padx=14, pady=6)
+        self.lbl_time.pack(padx=14, pady=5)
 
         self.slider_vol = ctk.CTkSlider(
             self.frame_controls,
@@ -351,8 +402,8 @@ class TTSApp(ctk.CTk):
             self.frame_controls,
             text="⬇ Guardar WAV",
             width=110,
-            height=34,
-            corner_radius=17,
+            height=32,
+            corner_radius=16,
             fg_color="#262f3f",
             hover_color="#374151",
             font=("Helvetica", 12, "bold"),
@@ -378,126 +429,73 @@ class TTSApp(ctk.CTk):
         self.tab_clone.grid_columnconfigure(1, weight=1)
         self.tab_clone.grid_columnconfigure(3, weight=1)
 
-        # Switch Auto-Clonar + Selector Voz Guía
-        self.sw_autoclone = ctk.CTkSwitch(
+        ctk.CTkLabel(
             self.tab_clone,
-            text="Auto-Clonar Tono/Timbre de Voz Base",
+            text="Voz Nativa del Modelo (Recomendado 'maria' en Canopy Multi-Voz):",
             font=("Helvetica", 12, "bold"),
-        )
-        self.sw_autoclone.select()
-        self.sw_autoclone.grid(row=0, column=0, columnspan=2, padx=10, pady=(6, 6), sticky="w")
+            anchor="w",
+        ).grid(row=0, column=0, columnspan=2, padx=10, pady=(6, 6), sticky="w")
 
-        ctk.CTkLabel(self.tab_clone, text="Voz Guía IA:", anchor="w").grid(
-            row=0, column=2, padx=10, pady=(6, 6), sticky="w"
-        )
         self.opt_speaker = ctk.CTkOptionMenu(
             self.tab_clone,
-            values=["maria", "lucia", "sofia", "carmen", "tara", "javi", "ninguna"],
-            width=140,
+            values=["maria", "tara", "leah", "javi", "ninguna"],
+            width=150,
         )
         self.opt_speaker.set("maria")
-        self.opt_speaker.grid(row=0, column=3, padx=10, pady=(6, 6), sticky="ew")
+        self.opt_speaker.grid(row=0, column=2, columnspan=2, padx=10, pady=(6, 6), sticky="w")
 
-        # Pitch Offset Manual (Semitonos)
-        self.lbl_pitch = ctk.CTkLabel(
-            self.tab_clone, text="Ajuste Tono: +0.0 st", width=155, anchor="w"
+        # Switch opcional para DSP suave (DESACTIVADO por defecto para no distorsionar la voz)
+        self.sw_autoclone = ctk.CTkSwitch(
+            self.tab_clone,
+            text="Forzar Shift de Tono DSP (+3.5 st, desactivar para voz 100% natural)",
+            font=("Helvetica", 12),
         )
-        self.lbl_pitch.grid(row=1, column=0, padx=10, pady=4, sticky="w")
+        self.sw_autoclone.deselect()
+        self.sw_autoclone.grid(row=1, column=0, columnspan=4, padx=10, pady=(2, 6), sticky="w")
+
+        # Pitch Offset Manual (Semitonos suaves)
+        self.lbl_pitch = ctk.CTkLabel(
+            self.tab_clone, text="Ajuste Tono Fino: +0.0 st", width=165, anchor="w"
+        )
+        self.lbl_pitch.grid(row=2, column=0, padx=10, pady=4, sticky="w")
         self.slider_pitch = ctk.CTkSlider(
             self.tab_clone,
-            from_=-12.0,
-            to=12.0,
-            number_of_steps=48,
-            command=lambda v: self.lbl_pitch.configure(text=f"Ajuste Tono: {float(v):+.1f} st"),
+            from_=-6.0,
+            to=6.0,
+            number_of_steps=24,
+            command=lambda v: self.lbl_pitch.configure(
+                text=f"Ajuste Tono Fino: {float(v):+.1f} st"
+            ),
         )
         self.slider_pitch.set(0.0)
-        self.slider_pitch.grid(row=1, column=1, padx=10, pady=4, sticky="ew")
+        self.slider_pitch.grid(row=2, column=1, padx=10, pady=4, sticky="ew")
 
-        # Formantes (Tracto Vocal)
-        self.lbl_formant = ctk.CTkLabel(
-            self.tab_clone, text="Formantes (Femenino): 1.18", width=175, anchor="w"
+        # Velocidad
+        self.lbl_speed = ctk.CTkLabel(
+            self.tab_clone, text="Velocidad de Habla: 1.00x", width=175, anchor="w"
         )
-        self.lbl_formant.grid(row=1, column=2, padx=10, pady=4, sticky="w")
-        self.slider_formant = ctk.CTkSlider(
-            self.tab_clone,
-            from_=0.75,
-            to=1.45,
-            number_of_steps=70,
-            command=lambda v: self.lbl_formant.configure(
-                text=f"Formantes (Femenino): {float(v):.2f}"
-            ),
-        )
-        self.slider_formant.set(1.18)
-        self.slider_formant.grid(row=1, column=3, padx=10, pady=4, sticky="ew")
-
-        # Fuerza de Timbre Espectral + Segundos de Referencia Zero-Shot
-        self.lbl_timbre = ctk.CTkLabel(
-            self.tab_clone, text="Fuerza Timbre Ref: 0.60", width=155, anchor="w"
-        )
-        self.lbl_timbre.grid(row=2, column=0, padx=10, pady=4, sticky="w")
-        self.slider_timbre = ctk.CTkSlider(
-            self.tab_clone,
-            from_=0.0,
-            to=1.0,
-            number_of_steps=50,
-            command=lambda v: self.lbl_timbre.configure(
-                text=f"Fuerza Timbre Ref: {float(v):.2f}"
-            ),
-        )
-        self.slider_timbre.set(0.60)
-        self.slider_timbre.grid(row=2, column=1, padx=10, pady=4, sticky="ew")
-
-        self.lbl_refdur = ctk.CTkLabel(
-            self.tab_clone, text="Ventana Ref Zero-Shot: 2.5s", width=175, anchor="w"
-        )
-        self.lbl_refdur.grid(row=2, column=2, padx=10, pady=4, sticky="w")
-        self.slider_refdur = ctk.CTkSlider(
+        self.lbl_speed.grid(row=2, column=2, padx=10, pady=4, sticky="w")
+        self.slider_speed = ctk.CTkSlider(
             self.tab_clone,
             from_=0.5,
-            to=5.0,
-            number_of_steps=45,
-            command=lambda v: self.lbl_refdur.configure(
-                text=f"Ventana Ref Zero-Shot: {float(v):.1f}s"
+            to=2.0,
+            number_of_steps=60,
+            command=lambda v: self.lbl_speed.configure(
+                text=f"Velocidad de Habla: {float(v):.2f}x"
             ),
         )
-        self.slider_refdur.set(2.5)
-        self.slider_refdur.grid(row=2, column=3, padx=10, pady=4, sticky="ew")
-
-        # Transcripción opcional del audio de referencia
-        ctk.CTkLabel(
-            self.tab_clone, text="Texto Ref (opcional):", anchor="w"
-        ).grid(row=3, column=0, padx=10, pady=(6, 4), sticky="w")
-        self.entry_reftext = ctk.CTkEntry(
-            self.tab_clone,
-            placeholder_text="Ej: Hola, bienvenidos a un nuevo capítulo de nuestra historia...",
-        )
-        self.entry_reftext.grid(
-            row=3, column=1, columnspan=3, padx=10, pady=(6, 4), sticky="ew"
-        )
+        self.slider_speed.set(1.0)
+        self.slider_speed.grid(row=2, column=3, padx=10, pady=4, sticky="ew")
 
     def _build_engine_tab(self):
         self.tab_engine.grid_columnconfigure(1, weight=1)
         self.tab_engine.grid_columnconfigure(3, weight=1)
 
-        # Velocidad + Temperatura
-        self.lbl_speed = ctk.CTkLabel(
-            self.tab_engine, text="Velocidad: 1.00x", width=155, anchor="w"
-        )
-        self.lbl_speed.grid(row=0, column=0, padx=10, pady=6, sticky="w")
-        self.slider_speed = ctk.CTkSlider(
-            self.tab_engine,
-            from_=0.5,
-            to=2.0,
-            number_of_steps=60,
-            command=lambda v: self.lbl_speed.configure(text=f"Velocidad: {float(v):.2f}x"),
-        )
-        self.slider_speed.set(1.0)
-        self.slider_speed.grid(row=0, column=1, padx=10, pady=6, sticky="ew")
-
+        # Temperatura + Top-K
         self.lbl_temp = ctk.CTkLabel(
-            self.tab_engine, text="Expresividad (Temp): 0.65", width=175, anchor="w"
+            self.tab_engine, text="Expresividad (Temp): 0.60", width=165, anchor="w"
         )
-        self.lbl_temp.grid(row=0, column=2, padx=10, pady=6, sticky="w")
+        self.lbl_temp.grid(row=0, column=0, padx=10, pady=6, sticky="w")
         self.slider_temp = ctk.CTkSlider(
             self.tab_engine,
             from_=0.1,
@@ -507,14 +505,13 @@ class TTSApp(ctk.CTk):
                 text=f"Expresividad (Temp): {float(v):.2f}"
             ),
         )
-        self.slider_temp.set(0.65)
-        self.slider_temp.grid(row=0, column=3, padx=10, pady=6, sticky="ew")
+        self.slider_temp.set(0.60)
+        self.slider_temp.grid(row=0, column=1, padx=10, pady=6, sticky="ew")
 
-        # Top-K + Top-P
         self.lbl_topk = ctk.CTkLabel(
-            self.tab_engine, text="Top-K: 50", width=155, anchor="w"
+            self.tab_engine, text="Top-K: 50", width=165, anchor="w"
         )
-        self.lbl_topk.grid(row=1, column=0, padx=10, pady=6, sticky="w")
+        self.lbl_topk.grid(row=0, column=2, padx=10, pady=6, sticky="w")
         self.slider_topk = ctk.CTkSlider(
             self.tab_engine,
             from_=1,
@@ -523,12 +520,13 @@ class TTSApp(ctk.CTk):
             command=lambda v: self.lbl_topk.configure(text=f"Top-K: {int(v)}"),
         )
         self.slider_topk.set(50)
-        self.slider_topk.grid(row=1, column=1, padx=10, pady=6, sticky="ew")
+        self.slider_topk.grid(row=0, column=3, padx=10, pady=6, sticky="ew")
 
+        # Top-P + Repeat Penalty
         self.lbl_topp = ctk.CTkLabel(
-            self.tab_engine, text="Top-P (Nucleus): 0.90", width=175, anchor="w"
+            self.tab_engine, text="Top-P (Nucleus): 0.90", width=165, anchor="w"
         )
-        self.lbl_topp.grid(row=1, column=2, padx=10, pady=6, sticky="w")
+        self.lbl_topp.grid(row=1, column=0, padx=10, pady=6, sticky="w")
         self.slider_topp = ctk.CTkSlider(
             self.tab_engine,
             from_=0.10,
@@ -539,13 +537,12 @@ class TTSApp(ctk.CTk):
             ),
         )
         self.slider_topp.set(0.90)
-        self.slider_topp.grid(row=1, column=3, padx=10, pady=6, sticky="ew")
+        self.slider_topp.grid(row=1, column=1, padx=10, pady=6, sticky="ew")
 
-        # Repeat Penalty + Max Audio Tokens
         self.lbl_reppen = ctk.CTkLabel(
-            self.tab_engine, text="Penaliz. Repetición: 1.12", width=155, anchor="w"
+            self.tab_engine, text="Penaliz. Repetición: 1.12", width=165, anchor="w"
         )
-        self.lbl_reppen.grid(row=2, column=0, padx=10, pady=6, sticky="w")
+        self.lbl_reppen.grid(row=1, column=2, padx=10, pady=6, sticky="w")
         self.slider_reppen = ctk.CTkSlider(
             self.tab_engine,
             from_=1.00,
@@ -556,46 +553,85 @@ class TTSApp(ctk.CTk):
             ),
         )
         self.slider_reppen.set(1.12)
-        self.slider_reppen.grid(row=2, column=1, padx=10, pady=6, sticky="ew")
+        self.slider_reppen.grid(row=1, column=3, padx=10, pady=6, sticky="ew")
 
+        # Max Audio Tokens + Seed
         self.lbl_maxtok = ctk.CTkLabel(
-            self.tab_engine, text="Máx. Tokens Audio: 840", width=175, anchor="w"
+            self.tab_engine, text="Máx. Tokens Audio: 700", width=165, anchor="w"
         )
-        self.lbl_maxtok.grid(row=2, column=2, padx=10, pady=6, sticky="w")
+        self.lbl_maxtok.grid(row=2, column=0, padx=10, pady=6, sticky="w")
         self.slider_maxtok = ctk.CTkSlider(
             self.tab_engine,
             from_=140,
-            to=2030,
-            number_of_steps=270,
+            to=1680,
+            number_of_steps=220,
             command=lambda v: self.lbl_maxtok.configure(
                 text=f"Máx. Tokens Audio: {int(v)}"
             ),
         )
-        self.slider_maxtok.set(840)
-        self.slider_maxtok.grid(row=2, column=3, padx=10, pady=6, sticky="ew")
+        self.slider_maxtok.set(700)
+        self.slider_maxtok.grid(row=2, column=1, padx=10, pady=6, sticky="ew")
 
-        # Seed
         ctk.CTkLabel(
-            self.tab_engine, text="Semilla (Seed, -1 = aleatoria):", anchor="w"
-        ).grid(row=3, column=0, padx=10, pady=6, sticky="w")
-        self.entry_seed = ctk.CTkEntry(self.tab_engine, width=120)
+            self.tab_engine, text="Semilla (Seed, -1=azar):", anchor="w"
+        ).grid(row=2, column=2, padx=10, pady=6, sticky="w")
+        self.entry_seed = ctk.CTkEntry(self.tab_engine, width=110)
         self.entry_seed.insert(0, "-1")
-        self.entry_seed.grid(row=3, column=1, padx=10, pady=6, sticky="w")
+        self.entry_seed.grid(row=2, column=3, padx=10, pady=6, sticky="w")
+
+    def load_selected_model(self):
+        label = self.opt_model.get()
+        model_id = MODEL_LABELS_TO_ID.get(label, "orpheus-es-conversacional-q4")
+        self.status_lbl.configure(
+            text=f"⏳ Cargando {model_id}...", text_color="#3b82f6"
+        )
+        threading.Thread(
+            target=self._load_model_worker, args=(model_id,), daemon=True
+        ).start()
+
+    def _load_model_worker(self, model_id: str):
+        try:
+            requests.post(
+                f"{self.api_url}/models/load",
+                json={"model_id": model_id},
+                timeout=10,
+            )
+        except Exception as e:
+            print("Error solicitando carga de modelo:", e)
+
+    def unload_model_from_ram(self):
+        self.status_lbl.configure(
+            text="🧹 Liberando RAM/VRAM...", text_color="#f59e0b"
+        )
+        threading.Thread(target=self._unload_model_worker, daemon=True).start()
+
+    def _unload_model_worker(self):
+        try:
+            resp = requests.post(f"{self.api_url}/models/unload", timeout=15)
+            if resp.status_code == 200:
+                self.after(
+                    0,
+                    lambda: self.status_lbl.configure(
+                        text="🧹 Memoria RAM/VRAM liberada", text_color="#10b981"
+                    ),
+                )
+        except Exception as e:
+            print("Error liberando modelo:", e)
 
     def get_current_config(self) -> dict:
         try:
             seed_val = int(self.entry_seed.get().strip())
         except Exception:
             seed_val = -1
+        model_id = MODEL_LABELS_TO_ID.get(
+            self.opt_model.get(), "orpheus-es-conversacional-q4"
+        )
         return {
+            "model_id": model_id,
             "reference_file": self.reference_audio_path,
-            "reference_text": self.entry_reftext.get().strip(),
-            "ref_duration": round(float(self.slider_refdur.get()), 2),
             "speaker_hint": self.opt_speaker.get(),
             "auto_clone_voice": bool(self.sw_autoclone.get()),
             "pitch_semitones": round(float(self.slider_pitch.get()), 2),
-            "formant_shift": round(float(self.slider_formant.get()), 2),
-            "timbre_strength": round(float(self.slider_timbre.get()), 2),
             "speed": round(float(self.slider_speed.get()), 2),
             "temperature": round(float(self.slider_temp.get()), 2),
             "top_k": int(self.slider_topk.get()),
@@ -606,10 +642,13 @@ class TTSApp(ctk.CTk):
         }
 
     def apply_config_dict(self, cfg: dict):
+        if "model_id" in cfg and cfg["model_id"] in MODEL_ID_TO_LABEL:
+            self.opt_model.set(MODEL_ID_TO_LABEL[cfg["model_id"]])
+
         ref_f = cfg.get("reference_file", DEFAULT_REF_FILE)
         if ref_f:
             self.reference_audio_path = ref_f
-            self.lbl_voice.configure(text=f"Ruta activa: {ref_f}")
+            self.lbl_voice.configure(text=f"Ruta por defecto: {ref_f}")
             base_n = os.path.basename(ref_f)
             if base_n in self.opt_ref_file.cget("values"):
                 self.opt_ref_file.set(base_n)
@@ -626,31 +665,12 @@ class TTSApp(ctk.CTk):
         if "pitch_semitones" in cfg:
             v = float(cfg["pitch_semitones"])
             self.slider_pitch.set(v)
-            self.lbl_pitch.configure(text=f"Ajuste Tono: {v:+.1f} st")
-
-        if "formant_shift" in cfg:
-            v = float(cfg["formant_shift"])
-            self.slider_formant.set(v)
-            self.lbl_formant.configure(text=f"Formantes (Femenino): {v:.2f}")
-
-        if "timbre_strength" in cfg:
-            v = float(cfg["timbre_strength"])
-            self.slider_timbre.set(v)
-            self.lbl_timbre.configure(text=f"Fuerza Timbre Ref: {v:.2f}")
-
-        if "ref_duration" in cfg:
-            v = float(cfg["ref_duration"])
-            self.slider_refdur.set(v)
-            self.lbl_refdur.configure(text=f"Ventana Ref Zero-Shot: {v:.1f}s")
-
-        if "reference_text" in cfg:
-            self.entry_reftext.delete(0, "end")
-            self.entry_reftext.insert(0, str(cfg["reference_text"]))
+            self.lbl_pitch.configure(text=f"Ajuste Tono Fino: {v:+.1f} st")
 
         if "speed" in cfg:
             v = float(cfg["speed"])
             self.slider_speed.set(v)
-            self.lbl_speed.configure(text=f"Velocidad: {v:.2f}x")
+            self.lbl_speed.configure(text=f"Velocidad de Habla: {v:.2f}x")
 
         if "temperature" in cfg:
             v = float(cfg["temperature"])
@@ -684,29 +704,25 @@ class TTSApp(ctk.CTk):
     def reset_default_params(self):
         self.apply_config_dict({
             "reference_file": DEFAULT_REF_FILE,
-            "reference_text": "",
-            "ref_duration": 2.5,
             "speaker_hint": "maria",
-            "auto_clone_voice": True,
+            "auto_clone_voice": False,
             "pitch_semitones": 0.0,
-            "formant_shift": 1.18,
-            "timbre_strength": 0.60,
             "speed": 1.0,
-            "temperature": 0.65,
+            "temperature": 0.60,
             "top_k": 50,
             "top_p": 0.90,
             "repeat_penalty": 1.12,
-            "max_audio_tokens": 840,
+            "max_audio_tokens": 700,
             "seed": -1,
         })
-        self.status_lbl.configure(text="✅ Parámetros restaurados", text_color="#10b981")
+        self.status_lbl.configure(text="✅ Parámetros naturales restaurados", text_color="#10b981")
 
     def save_preset_dialog(self):
         dest = fd.asksaveasfilename(
             initialdir=PRESETS_DIR,
             defaultextension=".json",
             filetypes=[("Preset JSON", "*.json")],
-            initialfile="voz_femenina_preset.json",
+            initialfile="voz_natural_preset.json",
         )
         if dest:
             with open(dest, "w", encoding="utf-8") as f:
@@ -731,7 +747,7 @@ class TTSApp(ctk.CTk):
         candidate = os.path.join(DEFAULT_REF_DIR, filename)
         if os.path.exists(candidate):
             self.reference_audio_path = candidate
-            self.lbl_voice.configure(text=f"Ruta activa: {candidate}")
+            self.lbl_voice.configure(text=f"Ruta por defecto: {candidate}")
             self.status_lbl.configure(text=f"✅ Voz base: {filename}", text_color="#10b981")
 
     def preview_reference_voice(self):
@@ -947,19 +963,37 @@ class TTSApp(ctk.CTk):
     def _apply_backend_status(self, data: dict):
         state = data.get("status")
         msg = data.get("message", "")
-        f0 = data.get("reference_f0_hz", 0.0)
-        if f0 and float(f0) > 50:
-            gender_tag = "Femenina" if float(f0) >= 165.0 else "Masculina"
-            self.lbl_f0_badge.configure(text=f"F0 Ref: ~{float(f0):.1f} Hz ({gender_tag})")
+        loaded_name = data.get("loaded_model_name", "Ninguno")
+        self.lbl_loaded_model.configure(
+            text=f"Activo: {loaded_name}",
+            text_color="#34d399" if state == "READY" else "#f59e0b",
+        )
+
+        mem = data.get("memory", {})
+        if mem:
+            proc_mb = mem.get("process_ram_mb", 0.0)
+            sys_u = mem.get("system_used_gb", 0.0)
+            sys_t = mem.get("system_total_gb", 0.0)
+            sys_p = mem.get("system_percent", 0.0)
+            ram_color = "#ef4444" if sys_p > 85 else ("#f59e0b" if sys_p > 70 else "#60a5fa")
+            self.lbl_ram.configure(
+                text=f"RAM App: {proc_mb:.0f} MB | Sistema: {sys_u:.1f}/{sys_t:.1f} GB ({sys_p:.0f}%)",
+                text_color=ram_color,
+            )
 
         if self.is_generating or state == "GENERATING":
-            self.status_lbl.configure(text="⏳ Clonando voz y generando...", text_color="#f59e0b")
+            self.status_lbl.configure(text="⏳ Generando voz natural...", text_color="#f59e0b")
             self.btn_generate.configure(state="disabled")
         elif state == "DOWNLOADING":
             self.status_lbl.configure(text=f"⏳ {msg}", text_color="#3b82f6")
             self.btn_generate.configure(state="disabled")
         elif state == "LOADING":
             self.status_lbl.configure(text=f"🧠 {msg}", text_color="#f59e0b")
+            self.btn_generate.configure(state="disabled")
+        elif state == "UNLOADED":
+            self.status_lbl.configure(
+                text="🧹 Memoria Libre (Carga un modelo para generar)", text_color="#60a5fa"
+            )
             self.btn_generate.configure(state="disabled")
         elif state in ["READY", "SIMULATION"]:
             self.status_lbl.configure(text=f"✅ {msg}", text_color="#10b981")
@@ -976,7 +1010,7 @@ class TTSApp(ctk.CTk):
         )
         if filepath:
             self.reference_audio_path = filepath
-            self.lbl_voice.configure(text=f"Ruta activa: {filepath}", text_color="#e5e7eb")
+            self.lbl_voice.configure(text=f"Ruta por defecto: {filepath}", text_color="#e5e7eb")
             threading.Thread(
                 target=self._upload_voice_thread, args=(filepath,), daemon=True
             ).start()
@@ -989,8 +1023,6 @@ class TTSApp(ctk.CTk):
                     f"{self.api_url}/upload_reference", files=files, timeout=15
                 )
             if resp.status_code == 200:
-                info = resp.json()
-                f0 = info.get("reference_f0_hz", 0.0)
                 choices = self._scan_local_ref_files()
                 self.after(
                     0,
@@ -998,7 +1030,7 @@ class TTSApp(ctk.CTk):
                         self.opt_ref_file.configure(values=choices),
                         self.opt_ref_file.set(os.path.basename(filepath)),
                         self.status_lbl.configure(
-                            text=f"✅ Voz cargada ({f0} Hz)", text_color="#10b981"
+                            text="✅ Voz base cargada", text_color="#10b981"
                         ),
                     ),
                 )
@@ -1011,9 +1043,9 @@ class TTSApp(ctk.CTk):
             return
 
         self.is_generating = True
-        self.btn_generate.configure(state="disabled", text="⏳ Clonando y Generando...")
-        self.status_lbl.configure(text="⏳ Clonando voz y generando...", text_color="#f59e0b")
-        eta_segs = max(5, int((len(text) / 22) * 2))
+        self.btn_generate.configure(state="disabled", text="⏳ Generando...")
+        self.status_lbl.configure(text="⏳ Generando voz natural...", text_color="#f59e0b")
+        eta_segs = max(4, int((len(text) / 24) * 2))
         self.lbl_eta.configure(text=f"ETA: ~{eta_segs}s")
 
         threading.Thread(target=self._generate_thread, args=(text,), daemon=True).start()
@@ -1034,7 +1066,7 @@ class TTSApp(ctk.CTk):
                 self.after(
                     0,
                     lambda: self.status_lbl.configure(
-                        text="✅ Voz Femenina Clonada y Reproduciendo", text_color="#10b981"
+                        text="✅ Audio Natural Generado y Reproduciendo", text_color="#10b981"
                     ),
                 )
             else:
@@ -1062,7 +1094,7 @@ class TTSApp(ctk.CTk):
                 0,
                 lambda: (
                     self.btn_generate.configure(
-                        state="normal", text="▶ Generar Audio Clonado"
+                        state="normal", text="▶ Generar Audio Natural"
                     ),
                     self.lbl_eta.configure(text="ETA: --"),
                 ),

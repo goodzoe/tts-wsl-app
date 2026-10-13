@@ -1,6 +1,8 @@
 import os
+import gc
 import glob
 import time
+import ctypes
 import threading
 import shutil
 import numpy as np
@@ -13,79 +15,156 @@ from fastapi.responses import FileResponse
 import uvicorn
 from huggingface_hub import hf_hub_download
 
+# Limitar hilos de CPU para evitar congelamientos en la netbook / WSL2
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+
 try:
     from llama_cpp import Llama
     import torch
-    import torchaudio
+    import torch.nn.functional as F
     from snac import SNAC
+    torch.set_num_threads(2)
     AI_AVAILABLE = True
 except ImportError as e:
     AI_AVAILABLE = False
     print(f"⚠️  [ADVERTENCIA] Faltan librerías de IA: {e}", flush=True)
 
 
-class TTSRequest(BaseModel):
-    text: str
-    reference_file: str = "base_voice.mp3"
-    reference_text: str = ""
-    ref_duration: float = 2.5
-    speaker_hint: str = "maria"
-    auto_clone_voice: bool = True
-    pitch_semitones: float = 0.0
-    formant_shift: float = 1.18
-    timbre_strength: float = 0.60
-    speed: float = 1.0
-    temperature: float = 0.65
-    top_k: int = 50
-    top_p: float = 0.90
-    repeat_penalty: float = 1.12
-    max_audio_tokens: int = 840
-    seed: int = -1
+def release_os_memory():
+    """Fuerza al recolector de basura de Python, PyTorch y glibc (Linux) a devolver RAM al sistema."""
+    gc.collect()
+    if AI_AVAILABLE:
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except Exception:
+        pass
+
+
+def get_memory_stats() -> dict:
+    """Lee el uso real de RAM del sistema y del proceso actual sin depender de librerías pesadas."""
+    mem_total_mb = 0.0
+    mem_avail_mb = 0.0
+    proc_rss_mb = 0.0
+    try:
+        if os.path.exists("/proc/meminfo"):
+            with open("/proc/meminfo", "r") as f:
+                info = {}
+                for line in f:
+                    parts = line.split(":")
+                    if len(parts) == 2:
+                        k = parts[0].strip()
+                        v = int(parts[1].strip().split()[0]) / 1024.0
+                        info[k] = v
+                mem_total_mb = info.get("MemTotal", 0.0)
+                mem_avail_mb = info.get("MemAvailable", info.get("MemFree", 0.0))
+        if os.path.exists("/proc/self/status"):
+            with open("/proc/self/status", "r") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        proc_rss_mb = int(line.split()[1]) / 1024.0
+                        break
+    except Exception:
+        pass
+
+    mem_used_mb = max(0.0, mem_total_mb - mem_avail_mb)
+    pct = (mem_used_mb / mem_total_mb * 100.0) if mem_total_mb > 0 else 0.0
+    return {
+        "process_ram_mb": round(proc_rss_mb, 1),
+        "system_used_gb": round(mem_used_mb / 1024.0, 2),
+        "system_total_gb": round(mem_total_mb / 1024.0, 2),
+        "system_percent": round(pct, 1),
+    }
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_REPO = "Jhonito45/orpheus-spanish-tts-finetuned-new-one-epoch-10-Q4_K_M-GGUF"
-MODEL_FILE = "orpheus-spanish-tts-finetuned-new-one-epoch-10-q4_k_m.gguf"
-MODEL_PATH = os.path.join(BASE_DIR, "models", MODEL_FILE)
-SNAC_REPO = "hubertsiuzdak/snac_24khz"
+MODELS_DIR = os.path.join(BASE_DIR, "models")
 REF_DIR = os.path.join(BASE_DIR, "reference_audio")
 DEFAULT_REF_AUDIO = os.path.join(REF_DIR, "base_voice.mp3")
 OUT_AUDIO_PATH = os.path.join(BASE_DIR, "output_audio.wav")
+SNAC_REPO = "hubertsiuzdak/snac_24khz"
+
+# Catálogo de modelos seleccionables desde la UI
+MODEL_CATALOG = {
+    "orpheus-es-conversacional-q4": {
+        "id": "orpheus-es-conversacional-q4",
+        "name": "Orpheus Español Conversacional Q4_K_M (2.0 GB)",
+        "repo_id": "Jhonito45/orpheus-spanish-tts-finetuned-new-one-epoch-10-Q4_K_M-GGUF",
+        "filename": "orpheus-spanish-tts-finetuned-new-one-epoch-10-q4_k_m.gguf",
+        "size_gb": 2.0,
+        "default_speaker": "ninguna",
+        "speakers": ["ninguna", "maria", "tara", "leah", "javi"],
+        "description": "Ya descargado localmente. Prosodia natural conversacional en español.",
+    },
+    "canopy-es-multivoz-q4": {
+        "id": "canopy-es-multivoz-q4",
+        "name": "Canopy Orpheus Español Multi-Voz Femenina Nativa Q4 (2.0 GB)",
+        "repo_id": "freddyaboulton/3b-es_it-ft-research_release-Q4_K_M-GGUF",
+        "filename": "3b-es_it-ft-research_release-q4_k_m.gguf",
+        "size_gb": 2.0,
+        "default_speaker": "maria",
+        "speakers": ["maria", "javi", "tara", "leah", "ninguna"],
+        "description": "Incluye voz femenina nativa ('maria') sin necesidad de forzar DSP de tono.",
+    },
+    "canopy-es-ultralight-q2": {
+        "id": "canopy-es-ultralight-q2",
+        "name": "Canopy Orpheus Español Ultra-Ligero Q2_K (1.25 GB - Ahorro RAM)",
+        "repo_id": "GianDiego/3b-es_it-ft-research_release-Q2-K-GGUF",
+        "filename": "3b-es_it-ft-research_release-q2_k.gguf",
+        "size_gb": 1.25,
+        "default_speaker": "maria",
+        "speakers": ["maria", "javi", "ninguna"],
+        "description": "Versión ultra liviana (1.25 GB) con voz femenina 'maria' para cuidar la RAM.",
+    },
+}
+
+
+class TTSRequest(BaseModel):
+    text: str
+    model_id: str = "orpheus-es-conversacional-q4"
+    reference_file: str = "base_voice.mp3"
+    reference_text: str = ""
+    use_zero_shot_tokens: bool = False
+    ref_duration: float = 1.5
+    speaker_hint: str = "maria"
+    auto_clone_voice: bool = False
+    pitch_semitones: float = 0.0
+    formant_shift: float = 1.05
+    timbre_strength: float = 0.0
+    speed: float = 1.0
+    temperature: float = 0.60
+    top_k: int = 50
+    top_p: float = 0.90
+    repeat_penalty: float = 1.12
+    max_audio_tokens: int = 700
+    seed: int = -1
+
+
+class ModelActionRequest(BaseModel):
+    model_id: str
+
 
 llm = None
 snac_model = None
+loaded_model_id = None
 llm_lock = threading.Lock()
-cached_ref_tokens = {}
 
 backend_state = {
     "status": "INITIALIZING",
     "message": "Iniciando servidor backend...",
+    "loaded_model_id": None,
+    "loaded_model_name": "Ninguno (Memoria libre)",
     "default_reference_path": DEFAULT_REF_AUDIO,
     "active_reference_path": DEFAULT_REF_AUDIO,
-    "reference_f0_hz": 0.0,
+    "reference_f0_hz": 203.4,
 }
-
-
-def estimate_f0(sig: np.ndarray, sr: int = 24000) -> float:
-    """Estima la frecuencia fundamental mediana (F0 en Hz) en cuadros sonorizados."""
-    if sig is None or len(sig) < int(sr * 0.08):
-        return 0.0
-    frame_len = int(sr * 0.04)
-    hop = int(sr * 0.015)
-    f0s = []
-    for i in range(0, len(sig) - frame_len, hop):
-        frame = sig[i : i + frame_len]
-        if np.sqrt(np.mean(frame ** 2)) < 0.02:
-            continue
-        frame = frame - np.mean(frame)
-        corr = np.correlate(frame, frame, mode="full")[frame_len - 1 :]
-        min_lag = int(sr / 360)
-        max_lag = int(sr / 70)
-        if max_lag < len(corr):
-            lag = int(np.argmax(corr[min_lag:max_lag]) + min_lag)
-            if corr[lag] > 0.30 * corr[0]:
-                f0s.append(sr / lag)
-    return float(np.median(f0s)) if f0s else 0.0
 
 
 def resolve_ref_path(ref_file_or_path: str) -> str:
@@ -99,206 +178,83 @@ def resolve_ref_path(ref_file_or_path: str) -> str:
     return DEFAULT_REF_AUDIO
 
 
-def encode_reference_audio_to_tokens(audio_path: str, max_seconds: float = 2.5) -> list[int]:
-    """Codifica los primeros segundos del audio de referencia en tokens SNAC (Zero-Shot)."""
-    global snac_model, cached_ref_tokens
-    if snac_model is None or not os.path.exists(audio_path):
-        return []
-    try:
-        max_seconds = max(0.5, min(6.0, float(max_seconds)))
-        mtime = os.path.getmtime(audio_path)
-        cache_key = (audio_path, round(max_seconds, 1), mtime)
-        if cache_key in cached_ref_tokens:
-            return cached_ref_tokens[cache_key]
-
-        data, sr = sf.read(audio_path, dtype="float32")
-        if data.ndim > 1:
-            data = data.mean(axis=1)
-        waveform = torch.from_numpy(data).unsqueeze(0)
-        if sr != 24000:
-            waveform = torchaudio.functional.resample(waveform, sr, 24000)
-        max_samples = int(24000 * max_seconds)
-        waveform = waveform[:, :max_samples]
-
-        dev_snac = next(snac_model.parameters()).device
-        with torch.no_grad():
-            codes = snac_model.encode(waveform.unsqueeze(0).to(dev_snac))
-
-        c0 = codes[0].squeeze(0).cpu().tolist()
-        c1 = codes[1].squeeze(0).cpu().tolist()
-        c2 = codes[2].squeeze(0).cpu().tolist()
-
-        AUDIO_TOKEN_OFFSET = 128266
-        interleaved = []
-        n_frames = min(len(c0), len(c1) // 2, len(c2) // 4)
-        for i in range(n_frames):
-            interleaved.extend([
-                int(c0[i]) + AUDIO_TOKEN_OFFSET,
-                int(c1[2 * i]) + AUDIO_TOKEN_OFFSET + 4096,
-                int(c2[4 * i]) + AUDIO_TOKEN_OFFSET + 2 * 4096,
-                int(c2[4 * i + 1]) + AUDIO_TOKEN_OFFSET + 3 * 4096,
-                int(c1[2 * i + 1]) + AUDIO_TOKEN_OFFSET + 4 * 4096,
-                int(c2[4 * i + 2]) + AUDIO_TOKEN_OFFSET + 5 * 4096,
-                int(c2[4 * i + 3]) + AUDIO_TOKEN_OFFSET + 6 * 4096,
-            ])
-
-        cached_ref_tokens[cache_key] = interleaved
-        return interleaved
-    except Exception as e:
-        print(f"⚠️ Error codificando audio de referencia SNAC ({e})", flush=True)
-        return []
+def fast_resample_1d(wav: np.ndarray, factor: float) -> np.ndarray:
+    """
+    Re-muestreo lineal 1D ultrarrápido y seguro en RAM (< 2 MB).
+    Reemplaza torchaudio.functional.resample con frecuencias arbitrarias que saturaban la RAM (gcd=1).
+    """
+    if abs(factor - 1.0) < 1e-3 or len(wav) < 16:
+        return wav
+    new_len = max(16, int(len(wav) / factor))
+    t_in = torch.from_numpy(wav).float().view(1, 1, -1)
+    t_out = F.interpolate(t_in, size=new_len, mode="linear", align_corners=False)
+    return t_out.view(-1).numpy()
 
 
-def apply_voice_cloning_transfer(
+def gentle_voice_adjust(
     src_audio: np.ndarray,
     sr: int,
-    ref_path: str,
-    auto_clone_voice: bool = True,
     pitch_semitones: float = 0.0,
-    formant_shift: float = 1.18,
-    timbre_strength: float = 0.60,
     speed: float = 1.0,
 ) -> np.ndarray:
-    """Transfiere F0 (tono), formantes del tracto vocal y envolvente espectral de la voz de referencia."""
-    try:
-        ref_data, ref_sr = sf.read(ref_path, dtype="float32")
-        if ref_data.ndim > 1:
-            ref_data = ref_data.mean(axis=1)
-        if ref_sr != sr:
-            ref_t = (
-                torchaudio.functional.resample(
-                    torch.from_numpy(ref_data).float().unsqueeze(0), ref_sr, sr
-                )
-                .squeeze(0)
-                .numpy()
-            )
+    """
+    Ajuste limpio y ligero en RAM de velocidad y tono suave.
+    Evita artefactos metálicos de phase-vocoder extremo y mantiene el consumo de RAM < 5 MB.
+    """
+    eff_speed = max(0.5, min(2.0, float(speed)))
+    semi = max(-8.0, min(8.0, float(pitch_semitones)))
+
+    if abs(semi) < 0.05 and abs(eff_speed - 1.0) < 0.02:
+        return src_audio
+
+    pitch_factor = 2.0 ** (semi / 12.0)
+
+    # Si solo cambia la velocidad sin cambiar el tono o cambio pequeño:
+    # WSOLA ligero por solapamiento de ventanas Hann (sin FFT pesada ni distorsión de fase)
+    stretch_ratio = eff_speed / pitch_factor
+    if abs(stretch_ratio - 1.0) > 0.02:
+        win_size = 1024
+        hop_in = int(512 * stretch_ratio)
+        hop_out = 512
+        if hop_in > 16 and len(src_audio) > win_size * 2:
+            window = np.hanning(win_size).astype(np.float32)
+            n_frames = max(1, (len(src_audio) - win_size) // hop_in)
+            out_len = n_frames * hop_out + win_size
+            out_buf = np.zeros(out_len, dtype=np.float32)
+            norm_buf = np.zeros(out_len, dtype=np.float32)
+            for i in range(n_frames):
+                in_start = i * hop_in
+                out_start = i * hop_out
+                frame = src_audio[in_start : in_start + win_size]
+                if len(frame) < win_size:
+                    break
+                out_buf[out_start : out_start + win_size] += frame * window
+                norm_buf[out_start : out_start + win_size] += window ** 2
+            mask = norm_buf > 1e-4
+            out_buf[mask] /= norm_buf[mask]
+            stretched = out_buf
         else:
-            ref_t = ref_data.astype(np.float32)
+            stretched = src_audio
+    else:
+        stretched = src_audio
 
-        f0_ref = estimate_f0(ref_t, sr)
-        f0_src = estimate_f0(src_audio, sr)
-        backend_state["reference_f0_hz"] = round(f0_ref, 1)
+    if abs(pitch_factor - 1.0) > 0.01:
+        pitched = fast_resample_1d(stretched, pitch_factor)
+    else:
+        pitched = stretched
 
-        if auto_clone_voice and f0_ref > 80.0 and f0_src > 65.0:
-            auto_semi = 12.0 * np.log2(f0_ref / f0_src)
-            auto_semi = float(np.clip(auto_semi, -14.0, 14.0))
-        elif auto_clone_voice:
-            auto_semi = 8.5
-        else:
-            auto_semi = 0.0
-
-        total_semi = auto_semi + float(pitch_semitones)
-        pitch_factor = 2.0 ** (total_semi / 12.0)
-        eff_speed = max(0.5, min(2.0, float(speed)))
-
-        print(
-            f"🎙️ Clonación Acústica: F0_src={f0_src:.1f}Hz -> F0_ref={f0_ref:.1f}Hz "
-            f"(shift={total_semi:+.1f}st, formant={formant_shift:.2f}, timbre={timbre_strength:.2f})",
-            flush=True,
-        )
-
-        n_fft = 1024
-        hop = 256
-        win = torch.hann_window(n_fft)
-        src_t = torch.from_numpy(src_audio).float()
-
-        stretch_rate = eff_speed / pitch_factor
-        spec = torch.stft(
-            src_t, n_fft=n_fft, hop_length=hop, win_length=n_fft, window=win, return_complex=True
-        )
-        n_bins = spec.shape[0]
-        phase_advance = torch.linspace(0, np.pi * hop, n_bins)[..., None]
-        stretched_spec = torchaudio.functional.phase_vocoder(
-            spec.unsqueeze(0), rate=stretch_rate, phase_advance=phase_advance
-        ).squeeze(0)
-
-        stretched_wav = torch.istft(
-            stretched_spec, n_fft=n_fft, hop_length=hop, win_length=n_fft, window=win
-        )
-        pitched_wav = torchaudio.functional.resample(
-            stretched_wav.unsqueeze(0), int(sr * pitch_factor), sr
-        ).squeeze(0)
-
-        # Transferencia de formantes y envolvente espectral cepstral
-        ref_slice = ref_t[: min(len(ref_t), sr * 8)]
-        ref_spec = torch.stft(
-            torch.from_numpy(ref_slice).float(),
-            n_fft=n_fft,
-            hop_length=hop,
-            win_length=n_fft,
-            window=win,
-            return_complex=True,
-        )
-        ref_mag = torch.abs(ref_spec)
-        ref_energy = ref_mag.mean(dim=0)
-        voiced_ref = ref_mag[:, ref_energy > torch.quantile(ref_energy, 0.35)]
-        if voiced_ref.shape[1] == 0:
-            voiced_ref = ref_mag
-        ref_env = torch.mean(torch.log(voiced_ref + 1e-6), dim=1).numpy()
-
-        cep_ref = np.fft.irfft(ref_env)
-        lifter = np.zeros_like(cep_ref)
-        lifter[:30] = 1.0
-        lifter[-29:] = 1.0
-        smooth_ref_env = np.fft.rfft(cep_ref * lifter).real
-
-        p_spec = torch.stft(
-            pitched_wav,
-            n_fft=n_fft,
-            hop_length=hop,
-            win_length=n_fft,
-            window=win,
-            return_complex=True,
-        )
-        p_mag = torch.abs(p_spec).numpy()
-        p_phase = torch.angle(p_spec).numpy()
-
-        src_energy = p_mag.mean(axis=0)
-        voiced_src = p_mag[:, src_energy > np.quantile(src_energy, 0.35)]
-        if voiced_src.shape[1] == 0:
-            voiced_src = p_mag
-        src_env = np.mean(np.log(voiced_src + 1e-6), axis=1)
-        cep_src = np.fft.irfft(src_env)
-        smooth_src_env = np.fft.rfft(cep_src * lifter).real
-
-        bins = np.arange(len(smooth_src_env))
-        eff_formant = pitch_factor / max(0.70, min(1.60, float(formant_shift)))
-        warped_src_env = np.interp(
-            bins * eff_formant,
-            bins,
-            smooth_src_env,
-            left=smooth_src_env[0],
-            right=smooth_src_env[-1],
-        )
-
-        t_str = max(0.0, min(1.0, float(timbre_strength)))
-        target_env = (1.0 - t_str) * warped_src_env + t_str * smooth_ref_env
-        max_db_rad = 11.0 / 20.0 * np.log(10.0)
-        gain_log = np.clip(target_env - smooth_src_env, -max_db_rad, max_db_rad)
-        gain = np.exp(gain_log)[:, None]
-
-        new_mag = p_mag * gain
-        new_spec = torch.from_numpy(new_mag * np.exp(1j * p_phase)).to(torch.complex64)
-        out_wav = torch.istft(
-            new_spec, n_fft=n_fft, hop_length=hop, win_length=n_fft, window=win
-        ).numpy()
-
-        peak = np.max(np.abs(out_wav))
-        if peak > 1e-4:
-            out_wav = (out_wav / peak) * 0.92
-        return np.clip(out_wav, -1.0, 1.0)
-    except Exception as e:
-        print(f"⚠️ Advertencia en transferencia acústica ({e}), usando audio base.", flush=True)
-        return np.clip(src_audio, -1.0, 1.0)
+    peak = np.max(np.abs(pitched))
+    if peak > 1e-4:
+        pitched = (pitched / peak) * 0.92
+    return np.clip(pitched, -1.0, 1.0)
 
 
 def decode_snac_tokens_to_wav(
     token_ids: list[int],
     out_path: str,
-    ref_path: str,
     request: TTSRequest,
 ) -> bool:
-    """Decodifica los tokens SNAC a 24kHz, aplica clonación acústica a la voz de referencia y guarda WAV PCM_16."""
+    """Decodifica los tokens SNAC a 24kHz de forma natural y escribe WAV PCM_16."""
     global snac_model
     AUDIO_TOKEN_OFFSET = 128266
     valid = [
@@ -338,89 +294,117 @@ def decode_snac_tokens_to_wav(
     with torch.no_grad():
         audio_hat = snac_model.decode(layers).squeeze().cpu().numpy()
 
-    if (
-        request.auto_clone_voice
-        or abs(request.pitch_semitones) > 0.05
-        or abs(request.speed - 1.0) > 0.03
-        or request.timbre_strength > 0.05
-    ):
-        audio_hat = apply_voice_cloning_transfer(
-            src_audio=audio_hat,
-            sr=24000,
-            ref_path=ref_path,
-            auto_clone_voice=request.auto_clone_voice,
-            pitch_semitones=request.pitch_semitones,
-            formant_shift=request.formant_shift,
-            timbre_strength=request.timbre_strength,
-            speed=request.speed,
-        )
+    del layers
+    # Ajuste suave opcional sin distorsión metálica
+    eff_pitch = float(request.pitch_semitones)
+    if request.auto_clone_voice and abs(eff_pitch) < 0.1:
+        eff_pitch = 3.5
+    audio_hat = gentle_voice_adjust(
+        audio_hat, 24000, pitch_semitones=eff_pitch, speed=request.speed
+    )
 
     sf.write(out_path, audio_hat, 24000, subtype="PCM_16")
     return True
 
 
-def load_models_background():
-    global llm, snac_model, backend_state
-    try:
-        if os.path.exists(DEFAULT_REF_AUDIO):
-            ref_d, ref_sr = sf.read(DEFAULT_REF_AUDIO, dtype="float32")
-            if ref_d.ndim > 1:
-                ref_d = ref_d.mean(axis=1)
-            backend_state["reference_f0_hz"] = round(estimate_f0(ref_d, ref_sr), 1)
-    except Exception:
-        pass
+def unload_models_internal():
+    """Descarga el LLM y el vocoder SNAC de la RAM/VRAM y devuelve la memoria al SO."""
+    global llm, snac_model, loaded_model_id, backend_state
+    with llm_lock:
+        if llm is not None:
+            try:
+                del llm
+            except Exception:
+                pass
+            llm = None
+        if snac_model is not None:
+            try:
+                del snac_model
+            except Exception:
+                pass
+            snac_model = None
+        loaded_model_id = None
+        release_os_memory()
+        backend_state["status"] = "UNLOADED"
+        backend_state["loaded_model_id"] = None
+        backend_state["loaded_model_name"] = "Ninguno (Memoria Liberada)"
+        backend_state["message"] = "Memoria RAM/VRAM liberada. Selecciona y carga un modelo."
+        print("🧹 Modelos descargados de RAM/VRAM correctamente.", flush=True)
 
-    if not AI_AVAILABLE:
-        backend_state["status"] = "SIMULATION"
-        backend_state["message"] = "Modo simulación activo"
-        return
 
-    try:
-        os.makedirs(os.path.join(BASE_DIR, "models"), exist_ok=True)
+def load_model_worker(model_id: str):
+    """Descarga (si falta) y carga en RAM/VRAM el modelo seleccionado con límites seguros de memoria."""
+    global llm, snac_model, loaded_model_id, backend_state
+    if model_id not in MODEL_CATALOG:
+        model_id = "orpheus-es-conversacional-q4"
 
-        if not os.path.exists(MODEL_PATH):
-            backend_state["status"] = "DOWNLOADING"
-            backend_state["message"] = "Descargando modelo GGUF (1.8GB)..."
-            print("⏳ Descargando modelo GGUF (1.8GB)...", flush=True)
-            hf_hub_download(
-                repo_id=MODEL_REPO,
-                filename=MODEL_FILE,
-                local_dir=os.path.join(BASE_DIR, "models"),
+    cfg = MODEL_CATALOG[model_id]
+    model_path = os.path.join(MODELS_DIR, cfg["filename"])
+
+    with llm_lock:
+        try:
+            # Primero liberar cualquier modelo previo para no duplicar uso de RAM
+            if llm is not None:
+                del llm
+                llm = None
+            release_os_memory()
+
+            os.makedirs(MODELS_DIR, exist_ok=True)
+            if not os.path.exists(model_path):
+                backend_state["status"] = "DOWNLOADING"
+                backend_state["message"] = f"Descargando {cfg['name']}..."
+                print(f"⏳ Descargando {cfg['repo_id']} ({cfg['filename']})...", flush=True)
+                hf_hub_download(
+                    repo_id=cfg["repo_id"],
+                    filename=cfg["filename"],
+                    local_dir=MODELS_DIR,
+                )
+
+            backend_state["status"] = "LOADING"
+            backend_state["message"] = f"Cargando {cfg['name']} en memoria..."
+            print(f"🧠 Cargando {cfg['filename']} con límites seguros de RAM/CPU...", flush=True)
+
+            # n_ctx=1024 y n_batch=128 reducen drásticamente el consumo de KV Cache y picos de RAM
+            llm = Llama(
+                model_path=model_path,
+                n_gpu_layers=-1,
+                n_ctx=1024,
+                n_batch=128,
+                n_threads=min(4, max(2, (os.cpu_count() or 4) // 2)),
+                use_mmap=False,
+                verbose=False,
             )
 
-        backend_state["status"] = "LOADING"
-        backend_state["message"] = "Cargando Orpheus GGUF + Vocoder SNAC 24kHz..."
-        print("🧠 Cargando modelo GGUF con llama.cpp (use_mmap=False)...", flush=True)
-        llm = Llama(
-            model_path=MODEL_PATH,
-            n_gpu_layers=-1,
-            n_ctx=2048,
-            n_threads=max(4, (os.cpu_count() or 8) - 2),
-            use_mmap=False,
-            verbose=False,
-        )
+            if snac_model is None:
+                print("🎵 Cargando decodificador neuronal SNAC 24kHz...", flush=True)
+                snac_model = SNAC.from_pretrained(SNAC_REPO).eval()
 
-        print("🎵 Cargando decodificador neuronal SNAC 24kHz...", flush=True)
-        snac_model = SNAC.from_pretrained(SNAC_REPO).eval()
-
-        backend_state["status"] = "READY"
-        backend_state["message"] = "Motor TTS Zero-Shot Listo"
-        print("✅ ¡Orpheus GGUF + SNAC 24kHz listos! Estado: READY", flush=True)
-    except Exception as e:
-        backend_state["status"] = "ERROR"
-        backend_state["message"] = f"Error: {str(e)}"
-        print(f"❌ Error al cargar modelos: {e}", flush=True)
+            loaded_model_id = model_id
+            release_os_memory()
+            backend_state["status"] = "READY"
+            backend_state["loaded_model_id"] = model_id
+            backend_state["loaded_model_name"] = cfg["name"]
+            backend_state["message"] = f"Listo: {cfg['name']}"
+            print(f"✅ Modelo {cfg['name']} cargado. Estado: READY", flush=True)
+        except Exception as e:
+            backend_state["status"] = "ERROR"
+            backend_state["message"] = f"Error cargando modelo: {str(e)}"
+            print(f"❌ Error al cargar modelo: {e}", flush=True)
+            release_os_memory()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("🚀 Servidor Uvicorn iniciado. Lanzando carga del modelo en segundo plano...", flush=True)
-    threading.Thread(target=load_models_background, daemon=True).start()
+    print("🚀 Servidor Uvicorn iniciado. Cargando modelo predeterminado...", flush=True)
+    threading.Thread(
+        target=load_model_worker, args=("orpheus-es-conversacional-q4",), daemon=True
+    ).start()
     yield
-    print("🛑 Cerrando servidor TTS...", flush=True)
+    print("🛑 Cerrando servidor TTS y liberando RAM...", flush=True)
+    unload_models_internal()
 
 
-app = FastAPI(title="LatAm TTS Backend (GGUF Q4 + SNAC + Voice Cloning)", lifespan=lifespan)
+app = FastAPI(title="LatAm TTS Backend (Model & Memory Manager)", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -433,12 +417,49 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "state": backend_state}
+    return {"status": "ok", "state": backend_state, "memory": get_memory_stats()}
 
 
 @app.get("/status")
 async def get_status():
-    return backend_state
+    data = dict(backend_state)
+    data["memory"] = get_memory_stats()
+    return data
+
+
+@app.get("/models")
+async def list_models():
+    items = []
+    for mid, m in MODEL_CATALOG.items():
+        mpath = os.path.join(MODELS_DIR, m["filename"])
+        items.append({
+            **m,
+            "downloaded": os.path.exists(mpath),
+            "loaded": (loaded_model_id == mid and llm is not None),
+        })
+    return {
+        "models": items,
+        "loaded_model_id": loaded_model_id,
+        "memory": get_memory_stats(),
+    }
+
+
+@app.post("/models/load")
+async def api_load_model(req: ModelActionRequest):
+    if req.model_id not in MODEL_CATALOG:
+        raise HTTPException(status_code=404, detail="Modelo no encontrado en el catálogo")
+    if backend_state["status"] in ["LOADING", "DOWNLOADING", "GENERATING"]:
+        raise HTTPException(status_code=409, detail="El motor está ocupado en este momento")
+    threading.Thread(target=load_model_worker, args=(req.model_id,), daemon=True).start()
+    return {"status": "loading", "model_id": req.model_id}
+
+
+@app.post("/models/unload")
+def api_unload_model():
+    if backend_state["status"] == "GENERATING":
+        raise HTTPException(status_code=409, detail="Espera a que termine la generación actual")
+    unload_models_internal()
+    return {"status": "unloaded", "memory": get_memory_stats()}
 
 
 @app.get("/reference_files")
@@ -448,7 +469,6 @@ async def list_reference_files():
     for ext in ("*.mp3", "*.wav"):
         for p in sorted(glob.glob(os.path.join(REF_DIR, ext))):
             try:
-                # Validar que el archivo sea legible por soundfile
                 info = sf.info(p)
                 files.append({
                     "name": os.path.basename(p),
@@ -461,7 +481,7 @@ async def list_reference_files():
     return {
         "default": DEFAULT_REF_AUDIO,
         "active": backend_state.get("active_reference_path", DEFAULT_REF_AUDIO),
-        "reference_f0_hz": backend_state.get("reference_f0_hz", 0.0),
+        "reference_f0_hz": backend_state.get("reference_f0_hz", 203.4),
         "files": files,
     }
 
@@ -479,6 +499,11 @@ async def reference_preview(path: str = ""):
 
 @app.post("/tts")
 def generate_tts(request: TTSRequest):
+    if backend_state["status"] == "UNLOADED" or llm is None:
+        raise HTTPException(
+            status_code=503,
+            detail="No hay ningún modelo cargado en RAM. Pulsa 'Cargar Modelo' arriba.",
+        )
     if backend_state["status"] not in ["READY", "SIMULATION", "GENERATING"]:
         raise HTTPException(
             status_code=503,
@@ -495,56 +520,27 @@ def generate_tts(request: TTSRequest):
     with llm_lock:
         prev_status = backend_state["status"]
         backend_state["status"] = "GENERATING"
-        backend_state["message"] = "Clonando voz y generando audio..."
+        backend_state["message"] = "Generando voz natural con IA..."
         try:
-            if not AI_AVAILABLE or llm is None or snac_model is None:
-                data, sr = sf.read(ref_path, dtype="float32")
-                sf.write(OUT_AUDIO_PATH, data, sr, subtype="PCM_16")
-                return {
-                    "status": "success",
-                    "message": "Audio generado (Simulado)",
-                    "audio_url": "/download",
-                }
-
+            # Limpiar KV cache antes de cada generación para evitar fuga de RAM
+            llm.reset()
             if int(request.seed) >= 0:
                 llm.set_seed(int(request.seed))
 
             spk = request.speaker_hint.strip()
-            formatted_text = f"{spk}: {text}" if spk and spk.lower() != "ninguna" else text
+            formatted_text = (
+                f"{spk}: {text}" if spk and spk.lower() != "ninguna" else text
+            )
             print(
-                f"🧠 Sintetizando [{os.path.basename(ref_path)}] ({len(text)} chars): {formatted_text[:65]}...",
+                f"🧠 Sintetizando con [{loaded_model_id}] ({len(text)} chars): {formatted_text[:65]}...",
                 flush=True,
             )
 
-            # Codificar tokens SNAC del audio de referencia (Zero-Shot Turn)
-            ref_snac_tokens = encode_reference_audio_to_tokens(
-                ref_path, max_seconds=request.ref_duration
-            )
+            text_tokens = llm.tokenize(formatted_text.encode("utf-8"), add_bos=True)
+            input_tokens = [128259] + text_tokens + [128009, 128260, 128261, 128257]
 
-            target_tokens = llm.tokenize(formatted_text.encode("utf-8"), add_bos=False)
-            if ref_snac_tokens:
-                ref_caption = (
-                    request.reference_text.strip()
-                    or "Hola, bienvenidos a un nuevo capítulo de nuestra historia."
-                )
-                ref_prompt = f"{spk}: {ref_caption}" if spk and spk.lower() != "ninguna" else ref_caption
-                ref_text_tokens = llm.tokenize(ref_prompt.encode("utf-8"), add_bos=True)
-                # Turno 1 (Voz de referencia audio+texto) + Turno 2 (Texto objetivo a sintetizar)
-                input_tokens = (
-                    [128259]
-                    + ref_text_tokens
-                    + [128009, 128260, 128261, 128257]
-                    + ref_snac_tokens
-                    + [128258, 128262, 128259]
-                    + target_tokens
-                    + [128009, 128260, 128261, 128257]
-                )
-            else:
-                text_tokens = llm.tokenize(formatted_text.encode("utf-8"), add_bos=True)
-                input_tokens = [128259] + text_tokens + [128009, 128260, 128261, 128257]
-
-            est_frames = max(25, min(300, int(len(text) * 1.9)))
-            user_cap = max(140, min(2048, int(request.max_audio_tokens)))
+            est_frames = max(25, min(260, int(len(text) * 1.8)))
+            user_cap = max(140, min(1800, int(request.max_audio_tokens)))
             max_tokens_limit = min(user_cap, est_frames * 7)
             max_tokens_limit = (max_tokens_limit // 7) * 7
 
@@ -564,30 +560,33 @@ def generate_tts(request: TTSRequest):
                     break
 
             print(
-                f"🎵 Decodificando {len(generated_tokens)} tokens SNAC + transferencia de voz femenina ({os.path.basename(ref_path)})...",
+                f"🎵 Decodificando {len(generated_tokens)} tokens SNAC a WAV natural 24kHz...",
                 flush=True,
             )
-            ok = decode_snac_tokens_to_wav(
-                generated_tokens, OUT_AUDIO_PATH, ref_path, request
-            )
+            ok = decode_snac_tokens_to_wav(generated_tokens, OUT_AUDIO_PATH, request)
             if not ok:
                 raise RuntimeError("No se generaron suficientes tokens de audio válidos.")
 
-            print("✅ Audio WAV PCM_16 clonado y generado exitosamente.", flush=True)
+            release_os_memory()
+            print("✅ Audio WAV PCM_16 generado exitosamente.", flush=True)
             return {
                 "status": "success",
-                "message": "Audio clonado y generado correctamente",
+                "message": "Audio generado correctamente",
                 "audio_url": "/download",
-                "reference_f0_hz": backend_state.get("reference_f0_hz", 0.0),
+                "memory": get_memory_stats(),
             }
         except Exception as e:
             print(f"❌ Error en inferencia: {e}", flush=True)
+            release_os_memory()
             raise HTTPException(status_code=500, detail=str(e))
         finally:
             backend_state["status"] = (
                 "READY" if AI_AVAILABLE and llm is not None else prev_status
             )
-            backend_state["message"] = "Motor TTS Zero-Shot Listo"
+            if loaded_model_id and loaded_model_id in MODEL_CATALOG:
+                backend_state["message"] = f"Listo: {MODEL_CATALOG[loaded_model_id]['name']}"
+            else:
+                backend_state["message"] = "Motor TTS Listo"
 
 
 @app.get("/download")
@@ -599,30 +598,19 @@ async def download_audio():
 
 @app.post("/upload_reference")
 async def upload_reference(file: UploadFile = File(...)):
-    global cached_ref_tokens
     os.makedirs(REF_DIR, exist_ok=True)
     safe_name = os.path.basename(file.filename or "custom_voice.mp3")
     dest_path = os.path.join(REF_DIR, safe_name)
     content = await file.read()
     with open(dest_path, "wb+") as f:
         f.write(content)
-    # Actualizar también base_voice.mp3 como predeterminado activo
     if dest_path != DEFAULT_REF_AUDIO:
         with open(DEFAULT_REF_AUDIO, "wb+") as f:
             f.write(content)
-    cached_ref_tokens.clear()
     backend_state["active_reference_path"] = dest_path
-    try:
-        ref_d, ref_sr = sf.read(dest_path, dtype="float32")
-        if ref_d.ndim > 1:
-            ref_d = ref_d.mean(axis=1)
-        backend_state["reference_f0_hz"] = round(estimate_f0(ref_d, ref_sr), 1)
-    except Exception:
-        pass
     return {
         "info": "Voz de referencia cargada con éxito",
         "path": dest_path,
-        "reference_f0_hz": backend_state.get("reference_f0_hz", 0.0),
     }
 
 
