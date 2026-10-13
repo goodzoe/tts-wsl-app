@@ -1,10 +1,13 @@
 import os
+import torch
+from transformers import pipeline
+import soundfile as sf
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from fastapi.responses import FileResponse
 import uvicorn
-import subprocess
+import uuid
 
 app = FastAPI(title="LatAm TTS Backend (sirekist98/spanish_conversational_tts)")
 
@@ -21,8 +24,14 @@ class TTSRequest(BaseModel):
     speed: float = 1.0
     temperature: float = 0.7 
 
-print("Iniciando motor TTS: sirekist98/spanish_conversational_tts...")
-print("Límite VRAM configurado: < 5GB")
+print("Inicializando pipeline TTS...")
+# Cargar modelo en memoria (Usando CPU/GPU según disponibilidad, buscando bajo consumo de VRAM)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Usando dispositivo: {device}")
+
+# Usar el modelo conversacional latino de sirekist98
+pipe = pipeline("text-to-speech", model="sirekist98/spanish_conversational_tts", device=device)
+print("Pipeline TTS cargado con éxito. Listo para solicitudes.")
 
 @app.post("/tts")
 async def generate_tts(request: TTSRequest):
@@ -31,8 +40,23 @@ async def generate_tts(request: TTSRequest):
     
     print(f"Generando audio para texto ({len(request.text)} chars) | Vel: {request.speed} | Temp: {request.temperature}")
     
-    # Placeholder de respuesta hasta que se integre la libreria final del TTS
-    return {"status": "success", "message": "Audio generado en backend local"}
+    os.makedirs("outputs", exist_ok=True)
+    out_filename = f"outputs/output_{uuid.uuid4().hex[:8]}.wav"
+    
+    try:
+        # Generar inferencia con el modelo (algunos modelos soportan forward params adicionales)
+        # La referencia base (zero-shot) dependería de si el modelo lo expone como voice_preset o audio_ref
+        
+        # En la mayoría de pipelines TTS de HF:
+        result = pipe(request.text)
+        
+        # Guardar a disco
+        sf.write(out_filename, result["audio"][0], result["sampling_rate"])
+        
+        return FileResponse(out_filename, media_type="audio/wav")
+    except Exception as e:
+        print(f"Error en inferencia: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/upload_reference")
 async def upload_reference(file: UploadFile = File(...)):
@@ -43,4 +67,4 @@ async def upload_reference(file: UploadFile = File(...)):
     return {"info": f"Voz base guardada con éxito en {file_location}"}
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8000)
