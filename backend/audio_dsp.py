@@ -2,6 +2,7 @@
 
 import os
 import gc
+import types
 import ctypes
 import numpy as np
 import soundfile as sf
@@ -10,18 +11,61 @@ from config import load_transcripts_map, save_transcript_for_file
 try:
     import torch
     import torch.nn.functional as F
+
+    # Shim de compatibilidad: PyTorch 2.5.1+cu121 junto con transformers >= 5.0
+    # requiere el atributo `torch.accelerator` durante el import perezoso de GenerationMixin.
+    if not hasattr(torch, "accelerator"):
+        torch.accelerator = types.SimpleNamespace(
+            current_accelerator=lambda: (
+                torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+            ),
+            is_available=lambda: torch.cuda.is_available(),
+        )
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
 
 
+def get_compute_device() -> str:
+    """Devuelve 'cuda:0' si la GPU NVIDIA está disponible en WSL2, o 'cpu' como respaldo."""
+    if TORCH_AVAILABLE:
+        try:
+            if torch.cuda.is_available():
+                return "cuda:0"
+        except Exception:
+            pass
+    return "cpu"
+
+
+def get_gpu_stats() -> dict:
+    """Obtiene el nombre y uso de VRAM de la GPU NVIDIA en WSL2 si está activa."""
+    if not TORCH_AVAILABLE:
+        return {"gpu_available": False, "gpu_name": "CPU Only", "vram_allocated_mb": 0.0, "vram_total_mb": 0.0}
+    try:
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            alloc_mb = torch.cuda.memory_allocated(0) / (1024.0 * 1024.0)
+            reserv_mb = torch.cuda.memory_reserved(0) / (1024.0 * 1024.0)
+            total_mb = props.total_memory / (1024.0 * 1024.0)
+            return {
+                "gpu_available": True,
+                "gpu_name": props.name,
+                "vram_allocated_mb": round(max(alloc_mb, reserv_mb), 1),
+                "vram_total_mb": round(total_mb, 1),
+            }
+    except Exception:
+        pass
+    return {"gpu_available": False, "gpu_name": "CPU Only", "vram_allocated_mb": 0.0, "vram_total_mb": 0.0}
+
+
 def release_os_memory() -> None:
-    """Fuerza al recolector de Python, PyTorch y glibc (Linux) a devolver páginas libres al kernel."""
+    """Fuerza al recolector de Python, PyTorch CUDA y glibc (Linux) a devolver páginas libres."""
     gc.collect()
     if TORCH_AVAILABLE:
         try:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
         except Exception:
             pass
     try:
@@ -31,7 +75,7 @@ def release_os_memory() -> None:
 
 
 def get_memory_stats() -> dict:
-    """Obtiene el uso actual de RAM del proceso y del sistema en Linux/WSL2."""
+    """Obtiene el uso actual de RAM del proceso, RAM del sistema y VRAM de la GPU en Linux/WSL2."""
     mem_total_mb = 0.0
     mem_avail_mb = 0.0
     proc_rss_mb = 0.0
@@ -58,22 +102,28 @@ def get_memory_stats() -> dict:
 
     mem_used_mb = max(0.0, mem_total_mb - mem_avail_mb)
     pct = (mem_used_mb / mem_total_mb * 100.0) if mem_total_mb > 0 else 0.0
+    gpu_info = get_gpu_stats()
     return {
         "process_ram_mb": round(proc_rss_mb, 1),
         "system_used_gb": round(mem_used_mb / 1024.0, 2),
         "system_total_gb": round(mem_total_mb / 1024.0, 2),
         "system_percent": round(pct, 1),
+        **gpu_info,
     }
 
 
 def fast_resample_1d(wav: np.ndarray, factor: float) -> np.ndarray:
     """Re-muestreo lineal 1D ultrarrápido y seguro en RAM (< 2 MB). Evita picos de torchaudio.resample."""
     if abs(factor - 1.0) < 1e-3 or len(wav) < 16:
-        return wav
+        return wav.astype(np.float32, copy=False)
     new_len = max(16, int(len(wav) / factor))
-    t_in = torch.from_numpy(wav).float().view(1, 1, -1)
-    t_out = F.interpolate(t_in, size=new_len, mode="linear", align_corners=False)
-    return t_out.view(-1).numpy()
+    if TORCH_AVAILABLE:
+        t_in = torch.from_numpy(np.asarray(wav, dtype=np.float32)).view(1, 1, -1)
+        t_out = F.interpolate(t_in, size=new_len, mode="linear", align_corners=False)
+        return t_out.view(-1).numpy()
+    x_old = np.linspace(0.0, 1.0, len(wav), dtype=np.float32)
+    x_new = np.linspace(0.0, 1.0, new_len, dtype=np.float32)
+    return np.interp(x_new, x_old, wav).astype(np.float32)
 
 
 def gentle_voice_adjust(
@@ -83,6 +133,7 @@ def gentle_voice_adjust(
     speed: float = 1.0,
 ) -> np.ndarray:
     """Ajuste limpio de velocidad (OLA) y tono fino (< 5 MB RAM)."""
+    src_audio = np.asarray(src_audio, dtype=np.float32)
     eff_speed = max(0.5, min(2.0, float(speed)))
     semi = max(-8.0, min(8.0, float(pitch_semitones)))
 
@@ -123,19 +174,23 @@ def gentle_voice_adjust(
     else:
         pitched = stretched
 
-    peak = np.max(np.abs(pitched))
+    peak = np.max(np.abs(pitched)) if len(pitched) > 0 else 0.0
     if peak > 1e-4:
         pitched = (pitched / peak) * 0.92
     return np.clip(pitched, -1.0, 1.0)
 
 
-def get_or_transcribe_reference_audio(ref_path: str, user_ref_text: str = "") -> str:
+def get_or_transcribe_reference_audio(
+    ref_path: str,
+    user_ref_text: str = "",
+    allow_auto_transcribe: bool = True,
+) -> str:
     """
     Devuelve la transcripción real del audio de referencia para clonación Zero-Shot precisa:
     1. Si el usuario ingresó transcripción manual, la usa y la guarda.
     2. Si ya existe en transcripts.json, la devuelve al instante.
-    3. Si es un audio nuevo sin transcripción, ejecuta openai/whisper-tiny (<150MB, ~1s),
-       libera la memoria y persiste el texto en transcripts.json.
+    3. Si es un audio nuevo sin transcripción y `allow_auto_transcribe=True`, ejecuta
+       `openai/whisper-tiny` en GPU (si hay CUDA) o CPU, libera la memoria y persiste el texto.
     """
     fname = os.path.basename(ref_path)
     if user_ref_text and user_ref_text.strip():
@@ -147,9 +202,14 @@ def get_or_transcribe_reference_audio(ref_path: str, user_ref_text: str = "") ->
     if fname in tmap and tmap[fname].strip():
         return tmap[fname].strip()
 
+    if not allow_auto_transcribe:
+        return "Hola, soy Barbie, qué lindo tenerte por acá."
+
     try:
         from transformers import WhisperProcessor, WhisperForConditionalGeneration
-        print(f"🎙️ Auto-transcribiendo audio de referencia '{fname}' con Whisper-tiny...", flush=True)
+
+        dev = get_compute_device()
+        print(f"🎙️ Auto-transcribiendo '{fname}' con Whisper-tiny en {dev}...", flush=True)
         data, sr = sf.read(ref_path, dtype="float32")
         if data.ndim > 1:
             data = data.mean(axis=1)
@@ -157,8 +217,8 @@ def get_or_transcribe_reference_audio(ref_path: str, user_ref_text: str = "") ->
         wav16 = fast_resample_1d(data, float(sr) / 16000.0) if sr != 16000 else data
 
         proc = WhisperProcessor.from_pretrained("openai/whisper-tiny")
-        w_model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny")
-        inp = proc(wav16, sampling_rate=16000, return_tensors="pt").input_features
+        w_model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny").to(dev)
+        inp = proc(wav16, sampling_rate=16000, return_tensors="pt").input_features.to(dev)
         with torch.no_grad():
             ids = w_model.generate(inp, language="spanish", task="transcribe")
         txt = proc.batch_decode(ids, skip_special_tokens=True)[0].strip()

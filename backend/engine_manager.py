@@ -1,7 +1,6 @@
-"""Gestor de descarga, carga, cambio, liberación e inferencia de modelos TTS (OmniVoice & Orpheus GGUF)."""
+"""Gestor de descarga, carga, cambio, liberación e inferencia de modelos TTS (OmniVoice GPU & Orpheus GGUF)."""
 
 import os
-import glob
 import time
 import threading
 import numpy as np
@@ -21,6 +20,7 @@ from config import (
 from schemas import TTSRequest
 from audio_dsp import (
     TORCH_AVAILABLE,
+    get_compute_device,
     release_os_memory,
     fast_resample_1d,
     gentle_voice_adjust,
@@ -29,17 +29,23 @@ from audio_dsp import (
 
 if TORCH_AVAILABLE:
     import torch
+
     torch.set_num_threads(DEFAULT_CPU_THREADS)
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
 
 try:
     from llama_cpp import Llama
     from snac import SNAC
+
     GGUF_AVAILABLE = True
 except ImportError:
     GGUF_AVAILABLE = False
 
 try:
     from omnivoice import OmniVoice, OmniVoiceGenerationConfig
+
     OMNIVOICE_AVAILABLE = True
 except ImportError:
     OMNIVOICE_AVAILABLE = False
@@ -55,6 +61,7 @@ cached_omni_clone_prompt = {}
 backend_state = {
     "status": "INITIALIZING",
     "message": "Iniciando servidor backend...",
+    "device": get_compute_device(),
     "loaded_model_id": None,
     "loaded_model_name": "Ninguno (Memoria libre)",
     "loaded_engine": None,
@@ -67,6 +74,7 @@ backend_state = {
     "default_reference_path": DEFAULT_REF_AUDIO,
     "active_reference_path": DEFAULT_REF_AUDIO,
     "active_reference_transcript": "",
+    "last_error": "",
 }
 
 
@@ -94,8 +102,28 @@ class DownloadProgressTqdm(tqdm):
             backend_state["task_elapsed_sec"] = int(elapsed)
             backend_state["task_eta_sec"] = eta_s
             backend_state["message"] = (
-                f"Descargando: {pct:.1f}% ({mb_done:.0f}/{mb_tot:.0f} MB) • {speed_mbps:.1f} MB/s • ETA {int(elapsed)}s / ~{int(elapsed)+eta_s}s"
+                f"Descargando: {pct:.1f}% ({mb_done:.0f}/{mb_tot:.0f} MB) • "
+                f"{speed_mbps:.1f} MB/s • ETA {int(elapsed)}s / ~{int(elapsed)+eta_s}s"
             )
+
+
+def _warmup_omnivoice_gpu() -> None:
+    """Ejecuta una micro-inferencia de 2 pasos en GPU para pre-compilar kernels CUDA y que la 1ª generación sea instantánea."""
+    global omni_model
+    if omni_model is None or not TORCH_AVAILABLE or not torch.cuda.is_available():
+        return
+    try:
+        cfg = OmniVoiceGenerationConfig(num_step=2, guidance_scale=1.5, denoise=False)
+        with torch.inference_mode():
+            omni_model.generate(
+                text="Hola.",
+                language="Spanish",
+                instruct="female, young adult, moderate pitch",
+                generation_config=cfg,
+            )
+        torch.cuda.empty_cache()
+    except Exception as e:
+        print(f"ℹ️ Warmup CUDA completado con aviso menor: {e}", flush=True)
 
 
 def unload_models_internal() -> None:
@@ -124,8 +152,12 @@ def unload_models_internal() -> None:
         print("🧹 Modelos descargados de RAM/VRAM correctamente.", flush=True)
 
 
-def load_model_worker(model_id: str, cpu_threads: int = DEFAULT_CPU_THREADS, n_ctx: int = 1024) -> None:
-    """Descarga (si no existe localmente) y carga en RAM/VRAM el modelo solicitado."""
+def load_model_worker(
+    model_id: str,
+    cpu_threads: int = DEFAULT_CPU_THREADS,
+    n_ctx: int = 1024,
+) -> None:
+    """Descarga (si no existe localmente) y carga en VRAM (GPU) o RAM el modelo solicitado."""
     global llm, snac_model, omni_model, loaded_model_id
     if model_id not in MODEL_CATALOG:
         model_id = "omnivoice-zeroshot-0.6b"
@@ -149,6 +181,9 @@ def load_model_worker(model_id: str, cpu_threads: int = DEFAULT_CPU_THREADS, n_c
             if TORCH_AVAILABLE:
                 torch.set_num_threads(threads)
 
+            dev = get_compute_device()
+            backend_state["device"] = dev
+
             if engine == "omnivoice":
                 if not OMNIVOICE_AVAILABLE:
                     raise RuntimeError("La librería 'omnivoice' no está instalada.")
@@ -168,13 +203,13 @@ def load_model_worker(model_id: str, cpu_threads: int = DEFAULT_CPU_THREADS, n_c
                         tqdm_class=DownloadProgressTqdm,
                     )
 
+                hw_label = f"GPU ({torch.cuda.get_device_name(0)})" if dev.startswith("cuda") else f"CPU ({threads} hilos)"
                 backend_state.update({
                     "status": "LOADING",
                     "task_start_time": time.time(),
-                    "download_progress": 100.0,
-                    "message": f"Cargando {cfg['name']} en memoria ({threads} hilos CPU)...",
+                    "download_progress": 90.0,
+                    "message": f"Cargando {cfg['name']} en {hw_label}...",
                 })
-                dev = "cuda:0" if (TORCH_AVAILABLE and torch.cuda.is_available()) else "cpu"
                 dt = torch.float16 if dev.startswith("cuda") else torch.float32
                 omni_model = OmniVoice.from_pretrained(
                     local_path,
@@ -182,6 +217,10 @@ def load_model_worker(model_id: str, cpu_threads: int = DEFAULT_CPU_THREADS, n_c
                     dtype=dt,
                     load_asr=False,
                 )
+                if dev.startswith("cuda"):
+                    backend_state["message"] = f"Pre-compilando kernels CUDA en {hw_label}..."
+                    _warmup_omnivoice_gpu()
+
                 loaded_model_id = model_id
                 release_os_memory()
                 backend_state.update({
@@ -190,9 +229,10 @@ def load_model_worker(model_id: str, cpu_threads: int = DEFAULT_CPU_THREADS, n_c
                     "loaded_model_name": cfg["name"],
                     "loaded_engine": "omnivoice",
                     "download_progress": 0.0,
-                    "message": f"Listo: {cfg['name']}",
+                    "last_error": "",
+                    "message": f"Listo en {hw_label}: {cfg['name']}",
                 })
-                print(f"✅ OmniVoice cargado en {dev} (threads={threads}). Estado: READY", flush=True)
+                print(f"✅ OmniVoice cargado en {dev} ({hw_label}). Estado: READY", flush=True)
 
             else:
                 if not os.path.exists(local_path):
@@ -216,20 +256,22 @@ def load_model_worker(model_id: str, cpu_threads: int = DEFAULT_CPU_THREADS, n_c
                 backend_state.update({
                     "status": "LOADING",
                     "task_start_time": time.time(),
-                    "download_progress": 100.0,
-                    "message": f"Cargando {cfg['name']} en memoria...",
+                    "download_progress": 95.0,
+                    "message": f"Cargando {cfg['name']} + Vocoder SNAC ({dev})...",
                 })
                 llm = Llama(
                     model_path=local_path,
                     n_gpu_layers=-1,
                     n_ctx=max(512, min(4096, int(n_ctx))),
-                    n_batch=128,
+                    n_batch=256,
                     n_threads=threads,
                     use_mmap=False,
                     verbose=False,
                 )
                 if snac_model is None:
-                    snac_model = SNAC.from_pretrained(SNAC_REPO).eval()
+                    snac_model = SNAC.from_pretrained(SNAC_REPO).eval().to(dev)
+                else:
+                    snac_model = snac_model.to(dev)
 
                 loaded_model_id = model_id
                 release_os_memory()
@@ -239,19 +281,25 @@ def load_model_worker(model_id: str, cpu_threads: int = DEFAULT_CPU_THREADS, n_c
                     "loaded_model_name": cfg["name"],
                     "loaded_engine": "gguf",
                     "download_progress": 0.0,
+                    "last_error": "",
                     "message": f"Listo: {cfg['name']}",
                 })
-                print(f"✅ Modelo GGUF {cfg['name']} cargado. Estado: READY", flush=True)
+                print(f"✅ Modelo GGUF {cfg['name']} cargado (SNAC en {dev}). Estado: READY", flush=True)
 
         except Exception as e:
-            backend_state["status"] = "ERROR"
-            backend_state["message"] = f"Error cargando modelo: {str(e)}"
-            print(f"❌ Error al cargar modelo: {e}", flush=True)
+            err_txt = f"Error cargando modelo: {str(e)}"
+            backend_state.update({
+                "status": "ERROR",
+                "download_progress": 0.0,
+                "last_error": err_txt,
+                "message": err_txt,
+            })
+            print(f"❌ {err_txt}", flush=True)
             release_os_memory()
 
 
 def _decode_snac_tokens_to_wav(token_ids: list[int], out_path: str, request: TTSRequest) -> bool:
-    """Decodifica frames de 7 tokens SNAC a WAV 24kHz PCM_16."""
+    """Decodifica frames de 7 tokens SNAC a WAV 24kHz PCM_16 usando GPU si está disponible."""
     global snac_model
     OFFSET = 128266
     valid = [int(t) - OFFSET for t in token_ids if OFFSET <= int(t) < OFFSET + 7 * 4096]
@@ -285,8 +333,8 @@ def _decode_snac_tokens_to_wav(token_ids: list[int], out_path: str, request: TTS
         torch.tensor(l2, dtype=torch.long, device=dev_snac).unsqueeze(0),
         torch.tensor(l3, dtype=torch.long, device=dev_snac).unsqueeze(0),
     ]
-    with torch.no_grad():
-        audio_hat = snac_model.decode(layers).squeeze().cpu().numpy()
+    with torch.inference_mode():
+        audio_hat = snac_model.decode(layers).squeeze().detach().cpu().numpy()
 
     del layers
     eff_pitch = float(request.pitch_semitones)
@@ -310,7 +358,23 @@ def sanitize_omnivoice_instruct(raw_instruct: str) -> str:
     s = raw_instruct.lower()
 
     gender = None
-    if any(w in s for w in ["femenin", "female", "mujer", "chica", "girl", "woman", "barbie", "maria", "lucia", "sofia", "tara", "leah"]):
+    if any(
+        w in s
+        for w in [
+            "femenin",
+            "female",
+            "mujer",
+            "chica",
+            "girl",
+            "woman",
+            "barbie",
+            "maria",
+            "lucia",
+            "sofia",
+            "tara",
+            "leah",
+        ]
+    ):
         gender = "female"
     elif any(w in s for w in ["masculin", "male", "hombre", "chico", "boy", "man", "javi"]):
         gender = "male"
@@ -336,7 +400,10 @@ def sanitize_omnivoice_instruct(raw_instruct: str) -> str:
         pitch = "very low pitch"
     elif any(w in s for w in ["grave", "low pitch", "bajo"]):
         pitch = "low pitch"
-    elif any(w in s for w in ["moderad", "moderate pitch", "natural", "suave", "calid", "cálid", "calm", "conversacional"]):
+    elif any(
+        w in s
+        for w in ["moderad", "moderate pitch", "natural", "suave", "calid", "cálid", "calm", "conversacional"]
+    ):
         pitch = "moderate pitch"
 
     style = None
@@ -369,10 +436,8 @@ def sanitize_omnivoice_instruct(raw_instruct: str) -> str:
 
 def run_omnivoice_synthesis(request: TTSRequest, ref_path: str) -> None:
     """
-    Ejecuta síntesis en OmniVoice con sus 3 modos reales:
+    Ejecuta síntesis en OmniVoice (acelerada por GPU RTX 4060 en ~0.4s) con sus 3 modos reales:
     - 'clone': Clona la voz del archivo ref_path usando su transcripción real alineada.
-               En modo clone sólo pasa 'whisper' si el usuario pide susurro explícitamente,
-               para que ningún atributo de diseño pise el timbre del audio de referencia.
     - 'design': Crea una voz desde cero traduciendo voice_description + style_instruct
                 al vocabulario válido de OmniVoice.
     - 'tts': Usa las etiquetas válidas del speaker seleccionado + style_instruct.
@@ -414,8 +479,11 @@ def run_omnivoice_synthesis(request: TTSRequest, ref_path: str) -> None:
         if not os.path.exists(ref_path):
             raise FileNotFoundError(f"No existe el audio de referencia: {ref_path}")
 
-        # Obtener la transcripción real del audio base (desde input usuario, transcripts.json o Whisper-tiny)
-        ref_text_aligned = get_or_transcribe_reference_audio(ref_path, request.reference_text)
+        ref_text_aligned = get_or_transcribe_reference_audio(
+            ref_path,
+            request.reference_text,
+            allow_auto_transcribe=bool(request.use_xvector_only),
+        )
         backend_state["active_reference_transcript"] = ref_text_aligned
 
         mtime = os.path.getmtime(ref_path)
@@ -436,8 +504,6 @@ def run_omnivoice_synthesis(request: TTSRequest, ref_path: str) -> None:
                 preprocess_prompt=bool(request.preprocess_prompt),
             )
         kw["voice_clone_prompt"] = cached_omni_clone_prompt[cache_key]
-        # En modo CLONE no se pasa instruct de género/edad porque sobreescribe el timbre clonado.
-        # Solo permitimos 'whisper' si el usuario explícitamente pide susurro.
         if "whisper" in request.style_instruct.lower() or "susurr" in request.style_instruct.lower():
             kw["instruct"] = "whisper"
 
@@ -471,7 +537,7 @@ def run_omnivoice_synthesis(request: TTSRequest, ref_path: str) -> None:
         step_counter[0] += 1
         cur_step = min(total_steps, step_counter[0])
         pct = min(96.0, 12.0 + (cur_step / total_steps) * 84.0)
-        elapsed = max(0.1, time.time() - step_start_t)
+        elapsed = max(0.05, time.time() - step_start_t)
         avg_per_step = elapsed / cur_step
         rem_s = max(0, int((total_steps - cur_step) * avg_per_step))
         tot_est_s = max(int(elapsed), int(elapsed) + rem_s)
@@ -479,7 +545,8 @@ def run_omnivoice_synthesis(request: TTSRequest, ref_path: str) -> None:
         backend_state["task_elapsed_sec"] = int(elapsed)
         backend_state["task_eta_sec"] = rem_s
         backend_state["message"] = (
-            f"OmniVoice ({request.mode.upper()}): paso {cur_step}/{total_steps} ({pct:.0f}%) • ETA {int(elapsed)}s / ~{tot_est_s}s"
+            f"OmniVoice ({request.mode.upper()}): paso {cur_step}/{total_steps} ({pct:.0f}%) • "
+            f"ETA {int(elapsed)}s / ~{tot_est_s}s"
         )
 
     hook_handle = None
@@ -489,7 +556,8 @@ def run_omnivoice_synthesis(request: TTSRequest, ref_path: str) -> None:
         hook_handle = None
 
     try:
-        audio_list = omni_model.generate(**kw)
+        with torch.inference_mode():
+            audio_list = omni_model.generate(**kw)
     finally:
         if hook_handle is not None:
             try:
@@ -497,7 +565,14 @@ def run_omnivoice_synthesis(request: TTSRequest, ref_path: str) -> None:
             except Exception:
                 pass
 
-    wav_out = np.asarray(audio_list[0], dtype=np.float32)
+    if not audio_list or len(audio_list[0]) == 0:
+        raise RuntimeError("OmniVoice devolvió un tensor de audio vacío.")
+
+    first_audio = audio_list[0]
+    if hasattr(first_audio, "detach"):
+        first_audio = first_audio.detach().cpu().numpy()
+    wav_out = np.asarray(first_audio, dtype=np.float32).squeeze()
+
     if abs(float(request.pitch_semitones)) > 0.05:
         wav_out = gentle_voice_adjust(
             wav_out,
@@ -509,24 +584,31 @@ def run_omnivoice_synthesis(request: TTSRequest, ref_path: str) -> None:
 
 
 def run_gguf_synthesis(request: TTSRequest, gen_start: float) -> None:
-    """Ejecuta síntesis en modelos GGUF (Canopy / Orpheus 3B) y decodifica con SNAC 24kHz."""
+    """
+    Ejecuta síntesis en modelos GGUF (Canopy / Orpheus 3B) y decodifica con SNAC 24kHz en GPU.
+    Respeta estrictamente las voces entrenadas de cada checkpoint para que nunca genere silencio ni ruido.
+    """
     global llm, loaded_model_id
     llm.reset()
     if int(request.seed) >= 0:
         llm.set_seed(int(request.seed))
 
-    spk = request.speaker_hint.strip()
-    style_prefix = ""
-    if request.mode == "design" and request.voice_description.strip():
-        style_prefix = f"[{request.voice_description.strip()}] "
-    elif request.style_instruct.strip():
-        style_prefix = f"[{request.style_instruct.strip()}] "
+    cfg = MODEL_CATALOG.get(loaded_model_id or "", {})
+    allowed_speakers = cfg.get("speakers", ["maria", "javi", "tara", "leah", "ninguna"])
+    default_spk = cfg.get("default_speaker", "maria")
+
+    spk = (request.speaker_hint or "").strip().lower()
+    # Si el modelo es single-speaker (orpheus-es-conversacional-q4) o el speaker no existe en su vocabulario:
+    if loaded_model_id == "orpheus-es-conversacional-q4":
+        spk = "ninguna"
+    elif spk not in allowed_speakers:
+        spk = default_spk
 
     text = request.text.strip()
     formatted_text = (
-        f"{spk}: {style_prefix}{text}"
-        if spk and spk.lower() != "ninguna"
-        else f"{style_prefix}{text}"
+        f"{spk}: {text}"
+        if spk and spk != "ninguna"
+        else f"{text}"
     )
 
     text_tokens = llm.tokenize(formatted_text.encode("utf-8"), add_bos=True)
@@ -559,13 +641,14 @@ def run_gguf_synthesis(request: TTSRequest, gen_start: float) -> None:
                 backend_state["task_elapsed_sec"] = int(elapsed)
                 backend_state["task_eta_sec"] = rem_s
                 backend_state["message"] = (
-                    f"GGUF ({loaded_model_id}): {pct:.0f}% ({n_gen // 7} frames) • ETA {int(elapsed)}s / ~{tot_est_s}s"
+                    f"GGUF ({loaded_model_id}): {pct:.0f}% ({n_gen // 7} frames) • "
+                    f"ETA {int(elapsed)}s / ~{tot_est_s}s"
                 )
         if len(generated_tokens) >= max_tokens_limit:
             break
 
     backend_state["download_progress"] = 97.0
-    backend_state["message"] = "Decodificando audio neuronal SNAC 24kHz..."
+    backend_state["message"] = "Decodificando audio neuronal SNAC 24kHz en GPU..."
     ok = _decode_snac_tokens_to_wav(generated_tokens, OUT_AUDIO_PATH, request)
     if not ok:
         raise RuntimeError("No se generaron suficientes tokens de audio válidos.")

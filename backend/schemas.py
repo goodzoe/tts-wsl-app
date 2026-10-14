@@ -11,12 +11,12 @@ class TTSRequest(BaseModel):
     language: str = "Spanish"
     reference_file: str = "base_voice.mp3"
     reference_text: str = ""
-    use_xvector_only: bool = False
+    use_xvector_only: bool = True
     speaker_hint: str = "maria"
     style_instruct: str = ""
     voice_description: str = ""
     # Parámetros OmniVoice (Difusión Iterativa)
-    num_step: int = 16
+    num_step: int = 12
     guidance_scale: float = 2.0
     t_shift: float = 0.1
     position_temperature: float = 5.0

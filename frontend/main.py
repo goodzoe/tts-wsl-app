@@ -1,4 +1,4 @@
-"""Ventana principal de Studio TTS LatAm (CustomTkinter) con diseño responsive scrollable y sin recortes de texto."""
+"""Ventana principal de Studio TTS LatAm (CustomTkinter) con diseño responsive, historial persistente de alertas y soporte GPU."""
 
 import os
 import json
@@ -34,9 +34,9 @@ ctk.set_default_color_theme("blue")
 class TTSApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Studio TTS LatAm - Clonación Zero-Shot (OmniVoice) & Modelos Locales")
-        self.geometry("950x880")
-        self.minsize(720, 680)
+        self.title("Studio TTS LatAm - Clonación Zero-Shot GPU (OmniVoice) & Modelos Locales")
+        self.geometry("980x900")
+        self.minsize(760, 680)
 
         self.api_url = "http://127.0.0.1:8000"
         self.downloaded_audio = os.path.join(BASE_DIR, "resultado.wav")
@@ -52,15 +52,18 @@ class TTSApp(ctk.CTk):
         self._models_synced_once = False
         self._last_wrap_w = 0
 
-        # Configurar layout principal en 3 zonas:
-        # 1. Zona superior fija (Encabezado + Estado Multilínea + Barra de progreso)
-        # 2. Zona central scrollable (Modelos + Modos + Pestañas + Texto) para que NUNCA se corte nada en pantallas chicas
+        # Protección para que los errores en rojo NUNCA desaparezcan solos antes de ser leídos:
+        self._sticky_error_msg = ""
+        self._sticky_error_until = 0.0
+
+        # Layout principal en 3 zonas:
+        # 1. Zona superior fija (Encabezado + Estado + Caja persistente de Errores/Alertas)
+        # 2. Zona central scrollable (Modelos + Modos + Pestañas + Texto)
         # 3. Zona inferior fija (Botón Generar + ETA + Reproductor de Audio)
         self._build_top_header()
         self._build_bottom_bar()
         self._build_scrollable_center()
 
-        # Recalcular salto de línea dinámico cuando cambia el tamaño de la ventana
         self.bind("<Configure>", self._on_window_resize)
 
         if os.path.exists(self.downloaded_audio):
@@ -78,14 +81,14 @@ class TTSApp(ctk.CTk):
         row_title.pack(fill="x")
 
         self.lbl_title = ctk.CTkLabel(
-            row_title, text="Studio TTS LatAm", font=("Helvetica", 22, "bold")
+            row_title, text="Studio TTS LatAm ⚡", font=("Helvetica", 22, "bold")
         )
         self.lbl_title.pack(side="left")
 
         self.lbl_ram = ctk.CTkLabel(
             row_title,
-            text="RAM App: -- MB | Sistema: -- GB",
-            font=("Consolas", 12, "bold"),
+            text="GPU: -- | RAM App: -- MB | Sistema: -- GB",
+            font=("Consolas", 11, "bold"),
             text_color="#60a5fa",
         )
         self.lbl_ram.pack(side="right", pady=(4, 0))
@@ -102,7 +105,7 @@ class TTSApp(ctk.CTk):
             font=("Helvetica", 12, "bold"),
             anchor="w",
             justify="left",
-            wraplength=860,
+            wraplength=880,
         )
         self.status_lbl.pack(fill="x", padx=12, pady=(5, 3))
 
@@ -115,26 +118,119 @@ class TTSApp(ctk.CTk):
         self.progress_bar.set(0.0)
         self.progress_bar.pack(fill="x", padx=12, pady=(0, 6))
 
+        # Banner Push Transitorio (auto-desaparece en ~8s) para avisos de compatibilidad de modelos
+        self.frame_toast_box = ctk.CTkFrame(
+            self.frame_top, corner_radius=8, fg_color="#1e293b", border_width=1, border_color="#f59e0b"
+        )
+        self.lbl_toast = ctk.CTkLabel(
+            self.frame_toast_box,
+            text="",
+            text_color="#fde68a",
+            font=("Helvetica", 11, "bold"),
+            anchor="w",
+            justify="left",
+            wraplength=820,
+        )
+        self.lbl_toast.pack(side="left", fill="x", expand=True, padx=(10, 4), pady=5)
+        self.btn_close_toast = ctk.CTkButton(
+            self.frame_toast_box,
+            text="✖",
+            width=28,
+            height=22,
+            corner_radius=6,
+            fg_color="#334155",
+            hover_color="#475569",
+            font=("Helvetica", 11, "bold"),
+            command=self.hide_transient_toast,
+        )
+        self.btn_close_toast.pack(side="right", padx=(2, 8), pady=4)
+        self._toast_after_id = None
+
+        # Banner de Error Persistente (copiable y con botón Cerrar, para que jamás desaparezca sin leerlo)
+        self.frame_error_box = ctk.CTkFrame(
+            self.frame_top, corner_radius=8, fg_color="#450a0a", border_width=1, border_color="#dc2626"
+        )
+        self.entry_error_log = ctk.CTkEntry(
+            self.frame_error_box,
+            fg_color="#450a0a",
+            border_width=0,
+            text_color="#fecaca",
+            font=("Consolas", 11, "bold"),
+            height=26,
+        )
+        self.entry_error_log.pack(side="left", fill="x", expand=True, padx=(10, 4), pady=4)
+
+        self.btn_copy_error = ctk.CTkButton(
+            self.frame_error_box,
+            text="📋 Copiar",
+            width=72,
+            height=24,
+            corner_radius=6,
+            fg_color="#7f1d1d",
+            hover_color="#991b1b",
+            font=("Helvetica", 11, "bold"),
+            command=self._copy_error_to_clipboard,
+        )
+        self.btn_copy_error.pack(side="right", padx=3, pady=4)
+
+        self.btn_clear_error = ctk.CTkButton(
+            self.frame_error_box,
+            text="✖ Ocultar",
+            width=72,
+            height=24,
+            corner_radius=6,
+            fg_color="#991b1b",
+            hover_color="#b91c1c",
+            font=("Helvetica", 11, "bold"),
+            command=self.clear_sticky_error,
+        )
+        self.btn_clear_error.pack(side="right", padx=(3, 8), pady=4)
+
+    def show_sticky_error(self, message: str):
+        """Muestra un error en rojo que NO es borrado por el polling de /status hasta que el usuario lo cierre o genere de nuevo."""
+        clean_msg = str(message).strip()
+        self._sticky_error_msg = clean_msg
+        self._sticky_error_until = time.time() + 180.0
+        self.status_lbl.configure(text=f"❌ {clean_msg}", text_color="#ef4444")
+        self.entry_error_log.configure(state="normal")
+        self.entry_error_log.delete(0, "end")
+        self.entry_error_log.insert(0, f"Último error registrado: {clean_msg}")
+        self.entry_error_log.configure(state="readonly")
+        self.frame_error_box.pack(fill="x", pady=(2, 2))
+
+    def clear_sticky_error(self):
+        self._sticky_error_msg = ""
+        self._sticky_error_until = 0.0
+        self.frame_error_box.pack_forget()
+
+    def _copy_error_to_clipboard(self):
+        if self._sticky_error_msg:
+            self.clipboard_clear()
+            self.clipboard_append(self._sticky_error_msg)
+            self.btn_copy_error.configure(text="✅ Copiado")
+            self.after(1500, lambda: self.btn_copy_error.configure(text="📋 Copiar"))
+
     def _build_scrollable_center(self):
         self.main_scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
         self.main_scroll.pack(side="top", fill="both", expand=True, padx=10, pady=2)
 
-        # --- SECCIÓN 0: GESTOR DE MODELOS IA Y MEMORIA ---
+        # --- SECCIÓN 0: GESTOR DE MODELOS IA Y MEMORIA (GRID RESPONSIVE) ---
         self.frame_models = ctk.CTkFrame(self.main_scroll, corner_radius=12)
         self.frame_models.pack(pady=4, padx=8, fill="x")
+        self.frame_models.grid_columnconfigure(0, weight=1)
 
         frame_models_top = ctk.CTkFrame(self.frame_models, fg_color="transparent")
-        frame_models_top.pack(fill="x", padx=12, pady=(6, 2))
+        frame_models_top.grid(row=0, column=0, padx=12, pady=(6, 2), sticky="ew")
+        frame_models_top.grid_columnconfigure(0, weight=1)
 
         self.lbl_models_header = ctk.CTkLabel(
             frame_models_top,
-            text="🧠 Modelo IA Activo y Gestión de Memoria (OmniVoice clona voz real / GGUF usa voces nativas):",
+            text="🧠 Modelo IA Activo y Gestión de Memoria (OmniVoice GPU clona voz / diseña voz / TTS):",
             font=("Helvetica", 12, "bold"),
             anchor="w",
             justify="left",
-            wraplength=580,
         )
-        self.lbl_models_header.pack(side="left", fill="x", expand=True)
+        self.lbl_models_header.grid(row=0, column=0, sticky="ew")
 
         self.lbl_loaded_model = ctk.CTkLabel(
             frame_models_top,
@@ -143,78 +239,84 @@ class TTSApp(ctk.CTk):
             text_color="#34d399",
             anchor="e",
             justify="right",
-            wraplength=320,
         )
-        self.lbl_loaded_model.pack(side="right")
+        self.lbl_loaded_model.grid(row=0, column=1, padx=(8, 0), sticky="e")
 
         frame_models_row = ctk.CTkFrame(self.frame_models, fg_color="transparent")
-        frame_models_row.pack(fill="x", padx=12, pady=(2, 8))
+        frame_models_row.grid(row=1, column=0, padx=12, pady=(2, 8), sticky="ew")
+        frame_models_row.grid_columnconfigure(0, weight=1)
 
         self.opt_model = ctk.CTkOptionMenu(
             frame_models_row,
             values=list(const.MODEL_LABELS_TO_ID.keys()),
-            width=340,
+            dynamic_resizing=False,
+            command=self.on_model_select_change,
         )
         self.opt_model.set("OmniVoice Zero-Shot 0.6B (Clonación Real + Diseño de Voz - 1.5 GB)")
-        self.opt_model.pack(side="left", padx=(0, 6), fill="x", expand=True)
-
-        self.btn_unload_model = ctk.CTkButton(
-            frame_models_row,
-            text="🧹 Liberar RAM",
-            width=115,
-            corner_radius=8,
-            fg_color="#b91c1c",
-            hover_color="#991b1b",
-            font=("Helvetica", 12, "bold"),
-            command=self.unload_model_from_ram,
-        )
-        self.btn_unload_model.pack(side="right", padx=(4, 0))
-
-        self.btn_add_local_file = ctk.CTkButton(
-            frame_models_row,
-            text="➕ Archivo .GGUF",
-            width=120,
-            corner_radius=8,
-            fg_color="#374151",
-            hover_color="#4b5563",
-            font=("Helvetica", 11, "bold"),
-            command=self.browse_and_add_local_gguf,
-        )
-        self.btn_add_local_file.pack(side="right", padx=3)
-
-        self.btn_add_local_dir = ctk.CTkButton(
-            frame_models_row,
-            text="📁 Carpeta Modelo",
-            width=125,
-            corner_radius=8,
-            fg_color="#374151",
-            hover_color="#4b5563",
-            font=("Helvetica", 11, "bold"),
-            command=self.browse_and_add_local_folder,
-        )
-        self.btn_add_local_dir.pack(side="right", padx=3)
+        self.opt_model.grid(row=0, column=0, padx=(0, 6), pady=2, sticky="ew")
 
         self.btn_load_model = ctk.CTkButton(
             frame_models_row,
             text="⚡ Cargar Modelo",
-            width=130,
+            width=126,
+            height=30,
             corner_radius=8,
             fg_color="#2563eb",
             hover_color="#1d4ed8",
             font=("Helvetica", 12, "bold"),
             command=self.load_selected_model,
         )
-        self.btn_load_model.pack(side="right", padx=(0, 3))
+        self.btn_load_model.grid(row=0, column=1, padx=3, pady=2)
 
-        # --- SECCIÓN 1: MODO DE OPERACIÓN + PRESETS + RESTABLECER ---
+        self.btn_add_local_dir = ctk.CTkButton(
+            frame_models_row,
+            text="📁 Carpeta Modelo",
+            width=126,
+            height=30,
+            corner_radius=8,
+            fg_color="#374151",
+            hover_color="#4b5563",
+            font=("Helvetica", 11, "bold"),
+            command=self.browse_and_add_local_folder,
+        )
+        self.btn_add_local_dir.grid(row=0, column=2, padx=3, pady=2)
+
+        self.btn_add_local_file = ctk.CTkButton(
+            frame_models_row,
+            text="➕ Archivo .GGUF",
+            width=122,
+            height=30,
+            corner_radius=8,
+            fg_color="#374151",
+            hover_color="#4b5563",
+            font=("Helvetica", 11, "bold"),
+            command=self.browse_and_add_local_gguf,
+        )
+        self.btn_add_local_file.grid(row=0, column=3, padx=3, pady=2)
+
+        self.btn_unload_model = ctk.CTkButton(
+            frame_models_row,
+            text="🧹 Liberar RAM",
+            width=116,
+            height=30,
+            corner_radius=8,
+            fg_color="#b91c1c",
+            hover_color="#991b1b",
+            font=("Helvetica", 12, "bold"),
+            command=self.unload_model_from_ram,
+        )
+        self.btn_unload_model.grid(row=0, column=4, padx=(3, 0), pady=2)
+
+        # --- SECCIÓN 1: MODO DE OPERACIÓN + PRESETS + RESTABLECER (GRID RESPONSIVE) ---
         frame_mode_bar = ctk.CTkFrame(self.main_scroll, fg_color="transparent")
         frame_mode_bar.pack(fill="x", padx=8, pady=(4, 2))
+        frame_mode_bar.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(
             frame_mode_bar,
             text="Modo:",
             font=("Helvetica", 13, "bold"),
-        ).pack(side="left", padx=(0, 6))
+        ).grid(row=0, column=0, padx=(0, 6), pady=2, sticky="w")
 
         self.seg_mode = ctk.CTkSegmentedButton(
             frame_mode_bar,
@@ -225,7 +327,33 @@ class TTSApp(ctk.CTk):
             command=self.on_mode_change,
         )
         self.seg_mode.set("🎙️ Clonación de Voz (Audio Base)")
-        self.seg_mode.pack(side="left")
+        self.seg_mode.grid(row=0, column=1, padx=(0, 8), pady=2, sticky="w")
+
+        self.btn_save_preset = ctk.CTkButton(
+            frame_mode_bar,
+            text="💾 Guardar Config",
+            width=115,
+            height=28,
+            corner_radius=8,
+            fg_color="#374151",
+            hover_color="#4b5563",
+            font=("Helvetica", 11, "bold"),
+            command=self.save_preset_dialog,
+        )
+        self.btn_save_preset.grid(row=0, column=2, padx=3, pady=2)
+
+        self.btn_load_preset = ctk.CTkButton(
+            frame_mode_bar,
+            text="📂 Cargar Config",
+            width=112,
+            height=28,
+            corner_radius=8,
+            fg_color="#374151",
+            hover_color="#4b5563",
+            font=("Helvetica", 11, "bold"),
+            command=self.load_preset_dialog,
+        )
+        self.btn_load_preset.grid(row=0, column=3, padx=3, pady=2)
 
         self.btn_reset_params = ctk.CTkButton(
             frame_mode_bar,
@@ -239,47 +367,21 @@ class TTSApp(ctk.CTk):
             font=("Helvetica", 12, "bold"),
             command=self.reset_default_params,
         )
-        self.btn_reset_params.pack(side="right", padx=(4, 0))
-
-        self.btn_load_preset = ctk.CTkButton(
-            frame_mode_bar,
-            text="📂 Cargar Config",
-            width=105,
-            height=28,
-            corner_radius=8,
-            fg_color="#374151",
-            hover_color="#4b5563",
-            font=("Helvetica", 11, "bold"),
-            command=self.load_preset_dialog,
-        )
-        self.btn_load_preset.pack(side="right", padx=3)
-
-        self.btn_save_preset = ctk.CTkButton(
-            frame_mode_bar,
-            text="💾 Guardar Config",
-            width=110,
-            height=28,
-            corner_radius=8,
-            fg_color="#374151",
-            hover_color="#4b5563",
-            font=("Helvetica", 11, "bold"),
-            command=self.save_preset_dialog,
-        )
-        self.btn_save_preset.pack(side="right", padx=3)
+        self.btn_reset_params.grid(row=0, column=4, padx=(3, 0), pady=2)
 
         self.lbl_ux_hint = ctk.CTkLabel(
             self.main_scroll,
-            text="💡 Ambas pestañas suman sus ajustes al generar: Pestaña 1 define Voz/Clonación/Estilo y Pestaña 2 controla el Motor IA (OmniVoice o GGUF) y Tono/Velocidad.",
+            text="💡 Ambas pestañas suman sus ajustes al generar: Pestaña 1 define Voz/Clonación/Estilo y Pestaña 2 controla el Motor IA (GPU/CPU) y Tono/Velocidad.",
             text_color="#9ca3af",
             font=("Helvetica", 11),
             anchor="w",
             justify="left",
-            wraplength=850,
+            wraplength=880,
         )
         self.lbl_ux_hint.pack(fill="x", padx=10, pady=(0, 2))
 
         # --- SECCIÓN 2: PESTAÑAS DE PARÁMETROS ---
-        self.tabs = ctk.CTkTabview(self.main_scroll, height=295, corner_radius=12)
+        self.tabs = ctk.CTkTabview(self.main_scroll, height=305, corner_radius=12)
         self.tabs.pack(fill="x", padx=8, pady=(0, 4))
         self.tab_voice = self.tabs.add("🎙️ 1. Voz, Clonación y Estilo (Activo)")
         self.tab_engine = self.tabs.add("⚙️ 2. Motor IA, Difusión, LLM y DSP (Activo)")
@@ -298,14 +400,13 @@ class TTSApp(ctk.CTk):
         self.textbox.pack(pady=2, padx=8, fill="both", expand=True)
         self.textbox.insert(
             "1.0",
-            "Hola, esta es una prueba de clonación de voz natural y expresiva en español.",
+            "Hola, esta es una prueba de clonación de voz natural y expresiva en español acelerada por GPU.",
         )
 
     def _build_bottom_bar(self):
         self.frame_bottom = ctk.CTkFrame(self, fg_color="transparent")
         self.frame_bottom.pack(side="bottom", fill="x", padx=18, pady=(2, 10))
 
-        # Fila de Acción Principal + ETA
         self.frame_actions = ctk.CTkFrame(self.frame_bottom, fg_color="transparent")
         self.frame_actions.pack(fill="x", pady=(2, 4))
 
@@ -313,6 +414,7 @@ class TTSApp(ctk.CTk):
             self.frame_actions,
             text="▶ Generar Audio Natural",
             font=("Helvetica", 14, "bold"),
+            width=210,
             height=38,
             corner_radius=10,
             command=self.generate_audio,
@@ -330,7 +432,7 @@ class TTSApp(ctk.CTk):
         self.btn_reset_bottom = ctk.CTkButton(
             self.frame_actions,
             text="↺ Restablecer Todo",
-            width=135,
+            width=145,
             height=34,
             corner_radius=8,
             fg_color="#374151",
@@ -427,7 +529,7 @@ class TTSApp(ctk.CTk):
         self.btn_save = ctk.CTkButton(
             self.frame_controls,
             text="⬇ Guardar WAV",
-            width=115,
+            width=120,
             height=32,
             corner_radius=16,
             fg_color="#262f3f",
@@ -439,7 +541,7 @@ class TTSApp(ctk.CTk):
 
     def _on_window_resize(self, event):
         if event.widget == self:
-            new_w = max(420, event.width - 75)
+            new_w = max(460, event.width - 75)
             if abs(new_w - self._last_wrap_w) < 12:
                 return
             self._last_wrap_w = new_w
@@ -448,34 +550,111 @@ class TTSApp(ctk.CTk):
                 self.lbl_ux_hint.configure(wraplength=new_w - 15)
                 self.lbl_voice.configure(wraplength=new_w - 40)
                 self.lbl_mode_desc.configure(wraplength=new_w - 40)
-                self.lbl_models_header.configure(wraplength=max(300, int(new_w * 0.58)))
+                self.lbl_models_header.configure(wraplength=max(320, int(new_w * 0.58)))
                 self.lbl_loaded_model.configure(wraplength=max(200, int(new_w * 0.38)))
             except Exception:
                 pass
 
+    def show_transient_toast(self, message: str, duration_ms: int = 8500):
+        """Muestra una notificación push transitoria que desaparece sola tras unos segundos sin bloquear al usuario."""
+        if self._toast_after_id:
+            try:
+                self.after_cancel(self._toast_after_id)
+            except Exception:
+                pass
+        self.lbl_toast.configure(text=f"🔔 {message}")
+        self.frame_toast_box.pack(fill="x", pady=(2, 2))
+        self._toast_after_id = self.after(duration_ms, self.hide_transient_toast)
+
+    def hide_transient_toast(self):
+        if self._toast_after_id:
+            try:
+                self.after_cancel(self._toast_after_id)
+            except Exception:
+                pass
+            self._toast_after_id = None
+        self.frame_toast_box.pack_forget()
+
+    def on_model_select_change(self, label: str):
+        """Adapta las opciones por defecto según las capacidades del modelo elegido, avisando con notificación transitoria pero permitiendo que el usuario reactive cualquier opción."""
+        model_id = const.MODEL_LABELS_TO_ID.get(label, "")
+        meta = const.MODEL_METADATA.get(model_id, {})
+        caps = meta.get("capabilities", {})
+        speakers = meta.get("speakers", ["maria", "lucia", "sofia", "tara", "leah", "javi", "ninguna"])
+        default_spk = meta.get("default_speaker", "maria")
+
+        if speakers:
+            self.opt_speaker.configure(values=speakers)
+            if self.opt_speaker.get() not in speakers:
+                self.opt_speaker.set(default_spk)
+
+        cur_mode = MODE_UI_TO_API.get(self.seg_mode.get(), "clone")
+        supports_clone = caps.get("supports_clone", model_id == "omnivoice-zeroshot-0.6b")
+        supports_design = caps.get("supports_design", model_id == "omnivoice-zeroshot-0.6b")
+        note = caps.get("compatibility_note", "")
+
+        if not supports_clone and cur_mode in ("clone", "design"):
+            # Desactivar por defecto la configuración incompatible pasando a Modo Texto a Voz (pero sin bloquear que el usuario la vuelva a pulsar)
+            ui_tts = MODE_API_TO_UI["tts"]
+            self.seg_mode.set(ui_tts)
+            self.opt_speaker.set(default_spk)
+            self.sw_denoise.deselect()
+            self.lbl_mode_desc.configure(
+                text=f"ℹ️ {label}: Modo cambiado por defecto a Texto a Voz ({default_spk}). Funciona con: Voces Nativas ({', '.join(speakers)}), Temp/Top-K/Top-P y Tono/Velocidad. (Puedes reactivar Clonación/Diseño si deseas forzarlo).",
+                text_color="#fbbf24",
+            )
+            self.show_transient_toast(
+                f"Incompatibilidad detectada en '{label}': se desactivó Clonación/Diseño por defecto y se activó Voces Nativas ({default_spk}). Funciona con Muestreo LLM + DSP. Puedes volver a activar cualquier opción manualmente."
+            )
+        else:
+            if supports_clone:
+                self.sw_denoise.select()
+            if note:
+                self.show_transient_toast(f"Modelo seleccionado: {note}", duration_ms=5500)
+
     def on_mode_change(self, ui_mode_label: str):
         mode = MODE_UI_TO_API.get(ui_mode_label, "clone")
+        cur_mid = const.MODEL_LABELS_TO_ID.get(self.opt_model.get(), "")
+        meta = const.MODEL_METADATA.get(cur_mid, {})
+        caps = meta.get("capabilities", {})
+        supports_clone = caps.get("supports_clone", "omnivoice" in cur_mid)
+        supports_design = caps.get("supports_design", "omnivoice" in cur_mid)
+
         if mode == "clone":
-            self.lbl_mode_desc.configure(
-                text="🎙️ MODO CLONACIÓN ACTIVO: Usa OmniVoice Zero-Shot con la transcripción real del Audio Base para clonar su voz exacta.",
-                text_color="#34d399",
-            )
-            cur_mid = const.MODEL_LABELS_TO_ID.get(self.opt_model.get(), "")
-            if cur_mid != "omnivoice-zeroshot-0.6b" and "omnivoice" not in cur_mid:
-                for lbl, mid in const.MODEL_LABELS_TO_ID.items():
-                    if mid == "omnivoice-zeroshot-0.6b":
-                        self.opt_model.set(lbl)
-                        break
+            if not supports_clone:
+                self.lbl_mode_desc.configure(
+                    text="⚠️ MODO CLONACIÓN FORZADO POR USUARIO: El modelo actual es GGUF (sin encoder Zero-Shot nativo). Se respetará tu elección usando el modelo cargado.",
+                    text_color="#f59e0b",
+                )
+                self.show_transient_toast(
+                    "Has reactivado Clonación manualmente sobre un modelo GGUF. Se respetará tu configuración sin cambiar de modelo.",
+                    duration_ms=6500,
+                )
+            else:
+                self.lbl_mode_desc.configure(
+                    text="🎙️ MODO CLONACIÓN ACTIVO: Usa la transcripción real del Audio Base para clonar su timbre exacto.",
+                    text_color="#34d399",
+                )
         elif mode == "tts":
             self.lbl_mode_desc.configure(
-                text="🗣️ MODO TEXTO A VOZ (VOCES NATIVAS): Usa la voz predefinida seleccionada ('maria', 'lucia', 'javi') + Instrucción de Estilo.",
+                text="🗣️ MODO TEXTO A VOZ (VOCES NATIVAS): Usa la voz predefinida seleccionada + Instrucción de Estilo y controles DSP/LLM.",
                 text_color="#60a5fa",
             )
         else:
-            self.lbl_mode_desc.configure(
-                text="✨ MODO DISEÑO DE VOZ: Crea una voz a medida a partir de la 'Descripción Diseño de Voz' en lenguaje natural.",
-                text_color="#c084fc",
-            )
+            if not supports_design:
+                self.lbl_mode_desc.configure(
+                    text="⚠️ MODO DISEÑO FORZADO POR USUARIO: El modelo actual es GGUF. Se adaptará tu descripción a sus voces entrenadas.",
+                    text_color="#f59e0b",
+                )
+                self.show_transient_toast(
+                    "Has reactivado Diseño de Voz manualmente sobre un modelo GGUF. Se respetará tu configuración sin cambiar de modelo.",
+                    duration_ms=6500,
+                )
+            else:
+                self.lbl_mode_desc.configure(
+                    text="✨ MODO DISEÑO DE VOZ: Crea una voz a medida a partir de la 'Descripción Diseño de Voz' en lenguaje natural.",
+                    text_color="#c084fc",
+                )
 
     def sync_models_from_backend(self):
         threading.Thread(target=self._sync_models_worker, daemon=True).start()
@@ -506,6 +685,12 @@ class TTSApp(ctk.CTk):
             name = m["name"]
             new_l2i[name] = mid
             new_i2l[mid] = name
+            const.MODEL_METADATA[mid] = {
+                "engine": m.get("engine", "gguf"),
+                "speakers": m.get("speakers", ["maria", "javi", "tara", "leah", "ninguna"]),
+                "default_speaker": m.get("default_speaker", "maria"),
+                "capabilities": m.get("capabilities", {}),
+            }
         if new_l2i:
             const.MODEL_LABELS_TO_ID = new_l2i
             const.MODEL_ID_TO_LABEL = new_i2l
@@ -537,6 +722,7 @@ class TTSApp(ctk.CTk):
             self._register_and_load_local_model(folderpath, engine=None)
 
     def _register_and_load_local_model(self, path: str, engine: str | None = None):
+        self.clear_sticky_error()
         self.status_lbl.configure(
             text=f"➕ Registrando y cargando modelo local: {os.path.basename(path)}...",
             text_color="#3b82f6",
@@ -558,29 +744,29 @@ class TTSApp(ctk.CTk):
                 if mid and mname:
                     const.MODEL_LABELS_TO_ID[mname] = mid
                     const.MODEL_ID_TO_LABEL[mid] = mname
+                    const.MODEL_METADATA[mid] = {
+                        "engine": model_info.get("engine", "gguf"),
+                        "speakers": model_info.get("speakers", ["maria", "tara", "leah", "javi", "ninguna"]),
+                        "default_speaker": model_info.get("default_speaker", "maria"),
+                        "capabilities": model_info.get("capabilities", {}),
+                    }
                     self.after(
                         0,
                         lambda: (
                             self.opt_model.configure(values=list(const.MODEL_LABELS_TO_ID.keys())),
                             self.opt_model.set(mname),
+                            self.on_model_select_change(mname),
                             self.load_selected_model(),
                         ),
                     )
             else:
                 detail = resp.json().get("detail", "No se pudo agregar el modelo local")
-                self.after(
-                    0,
-                    lambda d=detail: self.status_lbl.configure(text=f"❌ {d}", text_color="#ef4444"),
-                )
+                self.after(0, lambda d=detail: self.show_sticky_error(d))
         except Exception as e:
-            self.after(
-                0,
-                lambda err=str(e): self.status_lbl.configure(
-                    text=f"❌ Error agregando modelo local: {err}", text_color="#ef4444"
-                ),
-            )
+            self.after(0, lambda err=str(e): self.show_sticky_error(f"Error agregando modelo local: {err}"))
 
     def load_selected_model(self):
+        self.clear_sticky_error()
         label = self.opt_model.get()
         model_id = const.MODEL_LABELS_TO_ID.get(label, "omnivoice-zeroshot-0.6b")
         try:
@@ -598,15 +784,19 @@ class TTSApp(ctk.CTk):
 
     def _load_model_worker(self, model_id: str, threads: int):
         try:
-            requests.post(
+            resp = requests.post(
                 f"{self.api_url}/models/load",
                 json={"model_id": model_id, "cpu_threads": threads, "n_ctx": 1024},
                 timeout=10,
             )
+            if resp.status_code >= 400:
+                detail = resp.json().get("detail", "No se pudo cargar el modelo")
+                self.after(0, lambda d=detail: self.show_sticky_error(d))
         except Exception as e:
-            print("Error solicitando carga de modelo:", e)
+            self.after(0, lambda err=str(e): self.show_sticky_error(f"Error solicitando carga: {err}"))
 
     def unload_model_from_ram(self):
+        self.clear_sticky_error()
         self.status_lbl.configure(text="🧹 Liberando memoria RAM/VRAM...", text_color="#f59e0b")
         threading.Thread(target=self._unload_model_worker, daemon=True).start()
 
@@ -625,7 +815,7 @@ class TTSApp(ctk.CTk):
                     ),
                 )
         except Exception as e:
-            print("Error liberando modelo:", e)
+            self.after(0, lambda err=str(e): self.show_sticky_error(f"Error liberando memoria: {err}"))
 
     def get_current_config(self) -> dict:
         try:
@@ -723,7 +913,7 @@ class TTSApp(ctk.CTk):
         if "num_step" in cfg:
             v = int(cfg["num_step"])
             self.slider_steps.set(v)
-            self.lbl_steps.configure(text=f"Pasos Difusión (16=Rápido): {v}")
+            self.lbl_steps.configure(text=f"Pasos Difusión (12=GPU Rápido): {v}")
 
         if "guidance_scale" in cfg:
             v = float(cfg["guidance_scale"])
@@ -785,6 +975,7 @@ class TTSApp(ctk.CTk):
             self.opt_threads.set(str(cfg["cpu_threads"]))
 
     def reset_default_params(self):
+        self.clear_sticky_error()
         self.apply_config_dict(DEFAULT_PRESET_VALUES)
         self.status_lbl.configure(
             text="↺ Todos los parámetros y configuraciones fueron restablecidos a sus valores originales.",
@@ -817,14 +1008,13 @@ class TTSApp(ctk.CTk):
                     text="📂 Configuración cargada correctamente", text_color="#10b981"
                 )
             except Exception as e:
-                self.status_lbl.configure(text=f"❌ Error cargando preset: {e}", text_color="#ef4444")
+                self.show_sticky_error(f"Error cargando preset: {e}")
 
     def on_select_ref_dropdown(self, filename: str):
         candidate = os.path.join(DEFAULT_REF_DIR, filename)
         if os.path.exists(candidate):
             self.reference_audio_path = candidate
             self.lbl_voice.configure(text=f"Archivo activo: {filename} ({candidate})")
-            # Autocompletar la transcripción correspondiente a ese archivo
             self.transcripts_cache.update(load_local_transcripts())
             tr = self.transcripts_cache.get(filename, "")
             self.entry_ref_text.delete(0, "end")
@@ -859,7 +1049,7 @@ class TTSApp(ctk.CTk):
                     ),
                 )
         except Exception as e:
-            print("Error previsualizando voz base:", e)
+            self.after(0, lambda err=str(e): self.show_sticky_error(f"Error previsualizando voz base: {err}"))
 
     def _refresh_player_metadata(self, filepath: str) -> bool:
         if self.player.load_file(filepath):
@@ -872,7 +1062,7 @@ class TTSApp(ctk.CTk):
     def toggle_play_pause(self):
         res = self.player.toggle_play_pause(self.downloaded_audio)
         if res == "no_device":
-            self.status_lbl.configure(text="❌ Sin dispositivo de audio", text_color="#ef4444")
+            self.show_sticky_error("Sin dispositivo de audio disponible en WSLg / PulseAudio.")
         elif res == "no_file":
             self.status_lbl.configure(text="⚠️ Genera un audio primero", text_color="#f59e0b")
         elif res == "paused":
@@ -885,7 +1075,7 @@ class TTSApp(ctk.CTk):
         elif res == "playing":
             self.btn_play.configure(text="⏸")
         else:
-            self.status_lbl.configure(text="❌ Error reproduciendo audio", text_color="#ef4444")
+            self.show_sticky_error("Error reproduciendo el archivo WAV generado.")
 
     def toggle_mute(self):
         muted = self.player.toggle_mute()
@@ -960,7 +1150,7 @@ class TTSApp(ctk.CTk):
                 data = resp.json()
                 self.after(0, lambda d=data: self._apply_backend_status(d))
             else:
-                if not self.is_generating:
+                if not self.is_generating and not self._sticky_error_msg:
                     self.after(
                         0,
                         lambda: self.status_lbl.configure(
@@ -968,7 +1158,7 @@ class TTSApp(ctk.CTk):
                         ),
                     )
         except Exception:
-            if not self.is_generating:
+            if not self.is_generating and not self._sticky_error_msg:
                 self.after(
                     0,
                     lambda: self.status_lbl.configure(
@@ -1001,11 +1191,26 @@ class TTSApp(ctk.CTk):
             sys_u = mem.get("system_used_gb", 0.0)
             sys_t = mem.get("system_total_gb", 0.0)
             sys_p = mem.get("system_percent", 0.0)
+            gpu_avail = mem.get("gpu_available", False)
+            vram_mb = mem.get("vram_allocated_mb", 0.0)
+            gpu_tag = f"⚡ GPU VRAM: {vram_mb:.0f} MB | " if gpu_avail else "CPU | "
             ram_color = "#ef4444" if sys_p > 85 else ("#f59e0b" if sys_p > 70 else "#60a5fa")
             self.lbl_ram.configure(
-                text=f"RAM App: {proc_mb:.0f} MB | Sistema: {sys_u:.1f}/{sys_t:.1f} GB ({sys_p:.0f}%)",
+                text=f"{gpu_tag}RAM App: {proc_mb:.0f} MB | Sistema: {sys_u:.1f}/{sys_t:.1f} GB ({sys_p:.0f}%)",
                 text_color=ram_color,
             )
+
+        if state == "ERROR":
+            self.progress_bar.set(0.0)
+            self.btn_generate.configure(state="normal")
+            if msg:
+                self.show_sticky_error(msg)
+            return
+
+        # Si hay un error persistente activo y no estamos generando/descargando, NO pisar el texto rojo
+        if self._sticky_error_msg and time.time() < self._sticky_error_until and state == "READY" and not self.is_generating:
+            self.btn_generate.configure(state="normal")
+            return
 
         if state == "DOWNLOADING":
             self.progress_bar.set(max(0.02, min(1.0, dl_pct / 100.0)))
@@ -1035,10 +1240,6 @@ class TTSApp(ctk.CTk):
             self.progress_bar.set(1.0)
             self.status_lbl.configure(text=f"✅ {msg}", text_color="#10b981")
             self.btn_generate.configure(state="normal")
-        elif state == "ERROR":
-            self.progress_bar.set(0.0)
-            self.status_lbl.configure(text=f"❌ {msg}", text_color="#ef4444")
-            self.btn_generate.configure(state="normal")
 
     def upload_voice(self):
         init_dir = DEFAULT_REF_DIR if os.path.isdir(DEFAULT_REF_DIR) else BASE_DIR
@@ -1059,7 +1260,7 @@ class TTSApp(ctk.CTk):
             with open(filepath, "rb") as f:
                 files = {"file": (os.path.basename(filepath), f)}
                 resp = requests.post(
-                    f"{self.api_url}/upload_reference", files=files, timeout=30
+                    f"{self.api_url}/upload_reference", files=files, timeout=45
                 )
             if resp.status_code == 200:
                 rdata = resp.json()
@@ -1076,24 +1277,30 @@ class TTSApp(ctk.CTk):
                         self.entry_ref_text.delete(0, "end"),
                         self.entry_ref_text.insert(0, tr),
                         self.status_lbl.configure(
-                            text=f"✅ Voz subida y auto-transcrita: '{tr[:55]}...'",
+                            text=f"✅ Voz subida y auto-transcrita: '{tr[:60]}...'",
                             text_color="#10b981",
                         ),
                     ),
                 )
+            else:
+                self.after(0, lambda: self.show_sticky_error("No se pudo subir el audio de referencia."))
         except Exception as e:
-            print("Error subiendo voz:", e)
+            self.after(0, lambda err=str(e): self.show_sticky_error(f"Error subiendo voz: {err}"))
 
     def generate_audio(self):
         text = self.textbox.get("1.0", "end-1c")
         if not text.strip():
+            self.show_sticky_error("Ingresa un texto para convertir en voz.")
             return
 
+        self.clear_sticky_error()
         self.is_generating = True
         self.gen_local_start_t = time.time()
         cfg = self.get_current_config()
-        if cfg.get("mode") == "clone" or "omnivoice" in cfg.get("model_id", ""):
-            self.gen_target_eta_s = max(8, int(cfg.get("num_step", 16) * 1.4))
+
+        # Respetamos 100% el modelo y modo elegidos por el usuario (sin sobrescribir model_id).
+        if "omnivoice" in cfg.get("model_id", ""):
+            self.gen_target_eta_s = max(1, int(cfg.get("num_step", 12) * 0.12))
         else:
             self.gen_target_eta_s = max(4, int((len(text) / 18) * 2))
 
@@ -1102,7 +1309,7 @@ class TTSApp(ctk.CTk):
         self.status_lbl.configure(
             text=f"⏳ Generando voz ({cfg.get('mode', 'clone').upper()})...", text_color="#f59e0b"
         )
-        self.lbl_eta.configure(text=f"ETA 0s / {self.gen_target_eta_s}s")
+        self.lbl_eta.configure(text=f"ETA 0s / ~{self.gen_target_eta_s}s")
 
         threading.Thread(target=self._generate_thread, args=(text, cfg), daemon=True).start()
 
@@ -1110,49 +1317,52 @@ class TTSApp(ctk.CTk):
         try:
             payload["text"] = text
             resp = requests.post(f"{self.api_url}/tts", json=payload, timeout=360)
-            total_gen_s = max(1, int(time.time() - self.gen_local_start_t))
+            total_gen_s = round(max(0.1, time.time() - self.gen_local_start_t), 2)
             if resp.status_code == 200:
                 rdata = resp.json()
                 used_tr = rdata.get("reference_transcript", "")
-                audio_resp = requests.get(f"{self.api_url}/download", timeout=30)
-                if audio_resp.status_code == 200:
+                warns = rdata.get("warnings", [])
+                if warns:
+                    self.after(0, lambda w=warns[0]: self.show_transient_toast(w, duration_ms=8000))
+                audio_resp = requests.get(
+                    f"{self.api_url}/download",
+                    params={"t": int(time.time() * 1000)},
+                    timeout=30,
+                )
+                if audio_resp.status_code == 200 and len(audio_resp.content) > 200:
                     self.player.stop()
                     with open(self.downloaded_audio, "wb") as f:
                         f.write(audio_resp.content)
                     self.after(0, self._on_audio_ready)
-                self.after(
-                    0,
-                    lambda t=total_gen_s, tr=used_tr: (
-                        self.progress_bar.set(1.0),
-                        self.lbl_eta.configure(text=f"Completado en {t}s"),
-                        (
-                            self.entry_ref_text.insert(0, tr)
-                            if (tr and not self.entry_ref_text.get().strip())
-                            else None
+                    self.after(
+                        0,
+                        lambda t=total_gen_s, tr=used_tr: (
+                            self.progress_bar.set(1.0),
+                            self.lbl_eta.configure(text=f"Listo en {t:.1f}s"),
+                            (
+                                self.entry_ref_text.insert(0, tr)
+                                if (tr and not self.entry_ref_text.get().strip())
+                                else None
+                            ),
+                            self.status_lbl.configure(
+                                text=f"✅ Audio generado con éxito en {t:.2f}s y reproduciendo",
+                                text_color="#10b981",
+                            ),
                         ),
-                        self.status_lbl.configure(
-                            text=f"✅ Audio generado con éxito en {t}s y reproduciendo",
-                            text_color="#10b981",
-                        ),
-                    ),
-                )
+                    )
+                else:
+                    self.after(
+                        0,
+                        lambda: self.show_sticky_error("El servidor no devolvió un archivo WAV válido."),
+                    )
             else:
                 try:
-                    err_msg = resp.json().get("detail", "Error de generación")
+                    err_msg = resp.json().get("detail", f"Error HTTP {resp.status_code}")
                 except Exception:
-                    err_msg = "Error de generación"
-                self.after(
-                    0,
-                    lambda m=err_msg: self.status_lbl.configure(text=f"❌ {m}", text_color="#ef4444"),
-                )
+                    err_msg = f"Error HTTP {resp.status_code} en generación"
+                self.after(0, lambda m=err_msg: self.show_sticky_error(m))
         except Exception as e:
-            print("Error en generación:", e)
-            self.after(
-                0,
-                lambda err=str(e): self.status_lbl.configure(
-                    text=f"❌ Error: {err}", text_color="#ef4444"
-                ),
-            )
+            self.after(0, lambda err=str(e): self.show_sticky_error(f"Error de conexión/inferencia: {err}"))
         finally:
             self.is_generating = False
             self.after(

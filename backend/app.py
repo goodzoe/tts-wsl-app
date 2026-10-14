@@ -1,4 +1,4 @@
-"""Punto de entrada FastAPI para LatAm Studio TTS Backend."""
+"""Punto de entrada FastAPI para LatAm Studio TTS Backend (Control Total de Modelos y Capacidades)."""
 
 import os
 import glob
@@ -18,6 +18,7 @@ from config import (
     PREVIEW_AUDIO_PATH,
     MODEL_CATALOG,
     DEFAULT_CPU_THREADS,
+    build_capabilities_for_engine,
     is_model_downloaded,
     save_custom_models_to_disk,
     load_transcripts_map,
@@ -43,12 +44,12 @@ async def lifespan(app: FastAPI):
         daemon=True,
     ).start()
     yield
-    print("🛑 Cerrando servidor TTS y liberando RAM...", flush=True)
+    print("🛑 Cerrando servidor TTS y liberando RAM/VRAM...", flush=True)
     em.unload_models_internal()
 
 
 app = FastAPI(
-    title="LatAm Studio TTS Backend (OmniVoice Zero-Shot + Orpheus GGUF)",
+    title="LatAm Studio TTS Backend (Control Total Multi-Modelo: OmniVoice GPU + Orpheus GGUF)",
     lifespan=lifespan,
 )
 
@@ -74,6 +75,10 @@ async def get_status():
         and data.get("task_start_time", 0) > 0
     ):
         data["task_elapsed_sec"] = max(0, int(time.time() - data["task_start_time"]))
+    if em.loaded_model_id and em.loaded_model_id in MODEL_CATALOG:
+        data["loaded_model_capabilities"] = MODEL_CATALOG[em.loaded_model_id].get(
+            "capabilities", {}
+        )
     data["memory"] = get_memory_stats()
     return data
 
@@ -82,8 +87,11 @@ async def get_status():
 async def list_models():
     items = []
     for mid, m in MODEL_CATALOG.items():
+        eng = m.get("engine", "gguf")
+        caps = m.get("capabilities") or build_capabilities_for_engine(eng)
         items.append({
             **m,
+            "capabilities": caps,
             "downloaded": is_model_downloaded(m),
             "loaded": (
                 em.loaded_model_id == mid
@@ -127,6 +135,7 @@ async def api_add_local_model(req: AddLocalModelRequest):
         )
 
     model_id = f"custom-{base_name.lower().replace(' ', '-')}"
+    caps = build_capabilities_for_engine(engine)
     MODEL_CATALOG[model_id] = {
         "id": model_id,
         "name": display_name,
@@ -137,6 +146,8 @@ async def api_add_local_model(req: AddLocalModelRequest):
         "size_gb": size_gb,
         "default_speaker": "maria",
         "speakers": ["maria", "tara", "leah", "javi", "ninguna"],
+        "supported_modes": ["clone", "design", "tts"] if engine == "omnivoice" else ["tts"],
+        "capabilities": caps,
         "description": f"Modelo local agregado por el usuario ({path})",
         "is_custom": True,
     }
@@ -155,7 +166,11 @@ async def api_load_model(req: ModelActionRequest):
         args=(req.model_id, req.cpu_threads, req.n_ctx),
         daemon=True,
     ).start()
-    return {"status": "loading", "model_id": req.model_id}
+    return {
+        "status": "loading",
+        "model_id": req.model_id,
+        "model": MODEL_CATALOG[req.model_id],
+    }
 
 
 @app.post("/models/unload")
@@ -212,14 +227,10 @@ def generate_tts(request: TTSRequest):
     if not request.text or not request.text.strip():
         raise HTTPException(status_code=400, detail="Texto vacío")
 
-    # Si el usuario pide Clonación de Voz (mode == "clone") o solicitó un modelo específico que no está cargado,
-    # cambiamos automáticamente al modelo adecuado dentro del lock síncrono.
+    # Respetamos al 100% el modelo elegido por el usuario (sin redirecciones silenciosas).
     target_model = request.model_id
-    if request.mode == "clone" and target_model in MODEL_CATALOG:
-        if MODEL_CATALOG[target_model].get("engine") != "omnivoice":
-            # Los modelos GGUF de Orpheus no aceptan audio de referencia zero-shot;
-            # redirigir automáticamente a OmniVoice para garantizar clonación real.
-            target_model = "omnivoice-zeroshot-0.6b"
+    if target_model not in MODEL_CATALOG:
+        target_model = em.loaded_model_id or "omnivoice-zeroshot-0.6b"
 
     if (
         em.backend_state["status"] == "UNLOADED"
@@ -229,13 +240,25 @@ def generate_tts(request: TTSRequest):
         em.load_model_worker(target_model, request.cpu_threads, request.n_ctx)
 
     if em.llm is None and em.omni_model is None:
-        raise HTTPException(
-            status_code=503,
-            detail="No se pudo cargar el modelo en memoria. Verifica el estado arriba.",
-        )
+        err_msg = em.backend_state.get("last_error") or "No se pudo cargar el modelo en memoria."
+        raise HTTPException(status_code=503, detail=err_msg)
 
     ref_path = resolve_ref_path(request.reference_file)
     em.backend_state["active_reference_path"] = ref_path
+
+    model_cfg = MODEL_CATALOG.get(em.loaded_model_id or target_model, {})
+    caps = model_cfg.get("capabilities") or build_capabilities_for_engine(
+        model_cfg.get("engine", "gguf")
+    )
+    warnings = []
+    if request.mode == "clone" and not caps.get("supports_clone", False):
+        warnings.append(
+            f"El modelo '{model_cfg.get('name', target_model)}' es GGUF y no posee clonación Zero-Shot nativa; se sintetizó con su motor GGUF aplicando tus ajustes activos."
+        )
+    elif request.mode == "design" and not caps.get("supports_design", False):
+        warnings.append(
+            f"El modelo '{model_cfg.get('name', target_model)}' es GGUF y no posee diseño Zero-Shot nativo; se sintetizó adaptando tu descripción a su voz más cercana."
+        )
 
     with em.llm_lock:
         prev_status = em.backend_state["status"]
@@ -245,15 +268,22 @@ def generate_tts(request: TTSRequest):
             "task_start_time": gen_start,
             "task_elapsed_sec": 0,
             "download_progress": 5.0,
-            "message": f"Generando voz ({request.mode.upper()})...",
+            "last_error": "",
+            "message": f"Generando voz ({request.mode.upper()}) con {model_cfg.get('name', target_model)}...",
         })
         try:
             if em.backend_state.get("loaded_engine") == "omnivoice" and em.omni_model is not None:
-                est_omni_sec = max(6, int(request.num_step * 1.4))
+                is_gpu = str(em.backend_state.get("device", "")).startswith("cuda")
+                est_omni_sec = (
+                    max(1, int(request.num_step * 0.08))
+                    if is_gpu
+                    else max(6, int(request.num_step * 1.4))
+                )
                 em.backend_state["task_eta_sec"] = est_omni_sec
                 em.backend_state["download_progress"] = 10.0
                 em.backend_state["message"] = (
-                    f"Sintetizando con OmniVoice ({request.mode.upper()}, {request.num_step} pasos) • ETA 0s / ~{est_omni_sec}s"
+                    f"Sintetizando con OmniVoice {'GPU' if is_gpu else 'CPU'} "
+                    f"({request.mode.upper()}, {request.num_step} pasos) • ETA ~{est_omni_sec}s"
                 )
                 em.run_omnivoice_synthesis(request, ref_path)
                 em.backend_state["download_progress"] = 100.0
@@ -264,37 +294,58 @@ def generate_tts(request: TTSRequest):
                 raise RuntimeError("Motor TTS no inicializado correctamente.")
 
             release_os_memory()
-            print("✅ Audio WAV PCM_16 generado exitosamente.", flush=True)
+            elapsed_total = round(time.time() - gen_start, 2)
+            print(f"✅ Audio WAV PCM_16 generado exitosamente en {elapsed_total}s.", flush=True)
             return {
                 "status": "success",
-                "message": "Audio generado correctamente",
-                "audio_url": "/download",
+                "message": f"Audio generado correctamente en {elapsed_total}s",
+                "elapsed_sec": elapsed_total,
+                "audio_url": f"/download?t={int(time.time() * 1000)}",
                 "used_model_id": em.loaded_model_id,
+                "used_model_name": model_cfg.get("name", em.loaded_model_id),
+                "mode": request.mode,
+                "warnings": warnings,
+                "device": em.backend_state.get("device", "cpu"),
                 "reference_transcript": em.backend_state.get("active_reference_transcript", ""),
                 "memory": get_memory_stats(),
             }
         except Exception as e:
-            print(f"❌ Error en inferencia: {e}", flush=True)
+            err_detail = f"Error en inferencia ({request.mode}): {str(e)}"
+            em.backend_state.update({
+                "status": "ERROR",
+                "last_error": err_detail,
+                "message": err_detail,
+            })
+            print(f"❌ {err_detail}", flush=True)
             release_os_memory()
-            raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=500, detail=err_detail)
         finally:
             em.backend_state["download_progress"] = 0.0
             em.backend_state["task_eta_sec"] = 0
-            em.backend_state["status"] = (
-                "READY"
-                if (em.llm is not None or em.omni_model is not None)
-                else prev_status
-            )
-            if em.loaded_model_id and em.loaded_model_id in MODEL_CATALOG:
-                em.backend_state["message"] = f"Listo: {MODEL_CATALOG[em.loaded_model_id]['name']}"
-            else:
-                em.backend_state["message"] = "Motor TTS Listo"
+            if em.backend_state["status"] != "ERROR":
+                em.backend_state["status"] = (
+                    "READY"
+                    if (em.llm is not None or em.omni_model is not None)
+                    else prev_status
+                )
+                if em.loaded_model_id and em.loaded_model_id in MODEL_CATALOG:
+                    dev_tag = "GPU" if str(em.backend_state.get("device", "")).startswith("cuda") else "CPU"
+                    em.backend_state["message"] = (
+                        f"Listo ({dev_tag}): {MODEL_CATALOG[em.loaded_model_id]['name']}"
+                    )
+                else:
+                    em.backend_state["message"] = "Motor TTS Listo"
 
 
 @app.get("/download")
 async def download_audio():
     if os.path.exists(OUT_AUDIO_PATH):
-        return FileResponse(OUT_AUDIO_PATH, media_type="audio/wav", filename="resultado.wav")
+        return FileResponse(
+            OUT_AUDIO_PATH,
+            media_type="audio/wav",
+            filename="resultado.wav",
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+        )
     raise HTTPException(status_code=404, detail="Audio no encontrado")
 
 
@@ -308,7 +359,7 @@ async def upload_reference(file: UploadFile = File(...)):
         f.write(content)
     em.cached_omni_clone_prompt.clear()
     em.backend_state["active_reference_path"] = dest_path
-    transcript = get_or_transcribe_reference_audio(dest_path, "")
+    transcript = get_or_transcribe_reference_audio(dest_path, "", allow_auto_transcribe=True)
     return {
         "info": "Voz de referencia cargada y transcrita con éxito",
         "path": dest_path,

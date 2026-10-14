@@ -1,64 +1,180 @@
 .studio-tts-widget {
     position: fixed;
-    bottom: 24px;
-    right: 24px;
-    z-index: 999999;
-    width: 310px;
+    bottom: 20px;
+    right: 20px;
+    z-index: 2147483647;
+    width: 345px;
     background-color: #111827;
     color: #f9fafb;
     padding: 12px 14px;
     border-radius: 14px;
     border: 1px solid #374151;
-    box-shadow: 0 12px 24px -4px rgba(0, 0, 0, 0.5);
+    box-shadow: 0 14px 28px -4px rgba(0, 0, 0, 0.65);
     font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 12px;
+    line-height: 1.35;
+    box-sizing: border-box;
+}
+
+.studio-tts-widget * {
+    box-sizing: border-box;
 }
 
 .studio-tts-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: 6px;
+    margin-bottom: 8px;
+}
+
+.studio-tts-brand {
+    display: flex;
+    align-items: center;
+    gap: 6px;
 }
 
 .studio-tts-title {
-    font-size: 14px;
+    font-size: 13.5px;
     font-weight: 700;
     color: #60a5fa;
 }
 
-.studio-tts-select {
+.studio-tts-badge {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 6px;
+    border-radius: 999px;
+    background: #1f2937;
+    color: #34d399;
+    border: 1px solid #374151;
+}
+
+.studio-tts-header-btns {
+    display: flex;
+    gap: 4px;
+}
+
+.studio-tts-icon-btn {
     background: #1f2937;
     color: #e5e7eb;
+    border: 1px solid #374151;
+    border-radius: 6px;
+    padding: 3px 7px;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.studio-tts-icon-btn:hover,
+.studio-tts-icon-btn.active {
+    background: #2563eb;
+    border-color: #3b82f6;
+    color: #ffffff;
+}
+
+.studio-tts-row {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 7px;
+}
+
+.studio-tts-select,
+.studio-tts-select-full,
+.studio-tts-input {
+    background: #1f2937;
+    color: #f3f4f6;
     border: 1px solid #4b5563;
     border-radius: 6px;
-    padding: 3px 6px;
+    padding: 4px 6px;
     font-size: 11px;
+}
+
+.studio-tts-select {
+    flex: 1;
+    min-width: 0;
+}
+
+.studio-tts-select-full,
+.studio-tts-input {
+    width: 100%;
+}
+
+.studio-tts-adv-panel {
+    background: #0f172a;
+    border: 1px solid #1e293b;
+    border-radius: 8px;
+    padding: 8px;
+    margin-bottom: 8px;
+}
+
+.studio-tts-field {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    margin-bottom: 6px;
+    font-size: 11px;
+    color: #9ca3af;
+}
+
+.studio-tts-check-label {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    color: #d1d5db;
+    cursor: pointer;
+}
+
+.studio-tts-mini-btn {
+    background: #374151;
+    color: #f9fafb;
+    border: none;
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 11px;
+    cursor: pointer;
+}
+
+.studio-tts-mini-btn:hover {
+    background: #4b5563;
 }
 
 .studio-tts-status {
     font-size: 11px;
-    color: #d1d5db;
-    margin-bottom: 8px;
-    line-height: 1.35;
+    font-weight: 600;
+    color: #fbbf24;
+    margin-bottom: 4px;
     word-wrap: break-word;
 }
 
-.studio-tts-actions {
+.studio-tts-preview {
+    font-size: 11px;
+    color: #9ca3af;
+    background: #1f2937;
+    border-radius: 6px;
+    padding: 5px 7px;
+    margin-bottom: 8px;
+    max-height: 46px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.studio-tts-transport {
     display: flex;
-    width: 100%;
+    gap: 6px;
+    align-items: center;
 }
 
 .tts-floating-btn {
-    width: 100%;
+    flex: 1;
     background-color: #2563eb;
     color: #ffffff;
-    padding: 9px 14px;
+    padding: 8px 10px;
     border-radius: 8px;
     border: none;
-    font-size: 13px;
+    font-size: 12.5px;
     font-weight: 700;
     cursor: pointer;
-    transition: background-color 0.2s ease;
+    transition: background-color 0.15s ease;
 }
 
 .tts-floating-btn:hover {
@@ -70,9 +186,57 @@
     cursor: not-allowed;
 }
 
+.studio-tts-ctrl-btn {
+    background: #1f2937;
+    color: #f3f4f6;
+    border: 1px solid #374151;
+    border-radius: 8px;
+    padding: 7px 9px;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.studio-tts-ctrl-btn:hover {
+    background: #374151;
+}
+
+.studio-tts-stop:hover {
+    background: #991b1b;
+    border-color: #b91c1c;
+}
+
 .studio-tts-audio {
     display: none;
     width: 100%;
-    height: 34px;
+    height: 32px;
     margin-top: 8px;
+}
+
+.studio-tts-active-paragraph {
+    outline: 2px solid #3b82f6 !important;
+    background-color: rgba(59, 130, 246, 0.14) !important;
+    border-radius: 6px !important;
+    transition: background-color 0.2s ease !important;
+}
+
+/* Inspector DOM estilo Brave DevTools (Ctrl+Shift+C / Ctrl+Shift+X) */
+.studio-tts-inspector-highlight {
+    outline: 2px dashed #60a5fa !important;
+    background-color: rgba(37, 99, 235, 0.16) !important;
+    cursor: crosshair !important;
+}
+
+.studio-tts-inspector-tooltip {
+    position: fixed;
+    z-index: 2147483647;
+    background: #0f172a;
+    color: #f8fafc;
+    border: 1px solid #3b82f6;
+    border-radius: 6px;
+    padding: 5px 9px;
+    font-family: Consolas, monospace;
+    font-size: 11px;
+    pointer-events: none;
+    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.65);
+    white-space: nowrap;
 }

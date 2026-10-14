@@ -11,7 +11,7 @@ if [ ! -f "venv/.deps_installed" ]; then
     echo "Instalando dependencias de IA..."
     ./venv/bin/pip install --upgrade pip
     ./venv/bin/pip install fastapi uvicorn python-multipart pydantic huggingface-hub requests soundfile tqdm numpy
-    ./venv/bin/pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+    ./venv/bin/pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
     ./venv/bin/pip install snac llama-cpp-python accelerate librosa
     ./venv/bin/pip install --no-deps omnivoice pydub
     touch venv/.deps_installed

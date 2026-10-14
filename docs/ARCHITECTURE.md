@@ -1,23 +1,35 @@
-# Documentación Técnica y Arquitectura — Studio TTS LatAm
+# Arquitectura Técnica y Registro de Correcciones — Studio TTS LatAm (`tts-wsl-app`)
 
-## 1. Diagnóstico y Solución de Bugs Críticos
+**Última actualización:** 14 de Octubre de 2026  
+**Hardware activo verificado en WSL2:** `NVIDIA GeForce RTX 4060 Laptop GPU` (CUDA 12.1, `torch.float16`)  
+**Repositorio GitHub:** `https://github.com/goodzoe/tts-wsl-app` (rama `main`, sincronizada)
 
-### 1.1. ¿Por qué no se clonaba la voz antes y cómo se solucionó?
-1. **Modelos GGUF single/multi-speaker vs. Zero-Shot:** Los modelos `Orpheus 3B GGUF` (`Canopy` y `Jhonito45`) sólo generan a partir de texto con un prefijo de hablante entrenado (`maria: texto`), e ignoran por completo cualquier archivo de audio externo. Ahora, cuando el usuario selecciona el modo **`🎙️ Clonación de Voz (Audio Base)`**, el backend redirige y garantiza automáticamente el uso de **`OmniVoice Zero-Shot 0.6B`**.
-2. **Alineación obligatoria `ref_text` ↔ `ref_audio` en OmniVoice:** En `OmniVoice`, `create_voice_clone_prompt` concatena internamente `ref_text + target_text` junto a `ref_audio_tokens`. Si se envía una frase inventada que no coincide con lo que dice `base_voice.mp3`, la matriz de atención cruzada se desalinea y el modelo pierde el timbre de referencia.
-   - **Solución:** Se creó `backend/reference_audio/transcripts.json` con la transcripción real exacta de los audios incluidos (*"Hola, soy Barbie, qué lindo tenerte por acá..."*) y se integró auto-transcripción automática con `openai/whisper-tiny` en `audio_dsp.py` cada vez que el usuario sube un nuevo archivo `.mp3`/`.wav`.
-3. **Conflicto entre `instruct` (Voice Design) y `voice_clone_prompt` (Voice Clone):** En `OmniVoice`, pasar simultáneamente una descripción genérica de voz en `instruct` y un `voice_clone_prompt` hace que el condicionamiento de texto compita contra los tokens acústicos del audio base. Ahora, en modo `clone`, `instruct` se deja vacío por defecto salvo que el usuario escriba explícitamente una emoción puntual.
+---
 
-### 1.2. Diseño Responsive y Prevención de Corte de Texto en la UI
-- La ventana principal (`frontend/main.py`) ahora se divide en 3 áreas:
-  1. **Encabezado fijo superior** con el monitor de RAM y un banner de estado multilínea con barra de progreso (`CTkProgressBar`).
-  2. **Contenedor central `CTkScrollableFrame`** que aloja el gestor de modelos, modos y pestañas, evitando que los controles se aplasten o recorten en resoluciones bajas.
-  3. **Barra inferior fija** con el botón `▶ Generar Audio Natural`, el cronómetro `ETA 2s / 22s` y el reproductor de audio.
-- El evento `<Configure>` recalcula dinámicamente `wraplength` en todas las etiquetas informativas al redimensionar la ventana.
+## 1. Control Total del Usuario sobre Modelos y Capacidades (Cero Redirecciones Forzadas)
 
-### 1.3. Pausa Instantánea en WSLg PulseAudio
-- Se configuró `pygame.mixer` con `buffer=256` (~10 ms) en `frontend/audio_player.py` y se reemplazó `pause()` por captura de posición exacta + `stop()` para vaciar inmediatamente el buffer de salida de PulseAudio en WSLg sin retraso audible.
+1. **Adaptabilidad por Modelo (`backend/config.py`, `backend/app.py`, `frontend/main.py`):**
+   - Se eliminó el enrutamiento forzoso que cambiaba silenciosamente a `omnivoice-zeroshot-0.6b` cuando el usuario elegía **Clonación** o **Diseño de Voz**. Ahora tanto la UI como `POST /tts` **respetan al 100% el modelo seleccionado por el usuario** (incluidos modelos futuros descargados o agregados con `➕ Agregar Local`).
+   - Cada modelo expone su diccionario `capabilities` (`supports_clone`, `supports_design`, `supports_tts`, `supports_diffusion_steps`, `supports_llm_sampling`, `recommended_mode`, `compatibility_note`).
+2. **Notificación Push Transitoria y Desactivación por Defecto sin Bloqueos:**
+   - Cuando seleccionas o cargas un modelo que no soporta Clonación/Diseño Zero-Shot nativo (ej. modelos GGUF), la app muestra un **Toast Push Transitorio** (que desaparece solo tras unos segundos o con `✖`), **desactiva por defecto** la opción incompatible pasando a **Modo Texto a Voz (Voces Nativas)** e informa qué ajustes funcionan con ese modelo (Voces Nativas + Muestreo LLM Temp/Top-K/Top-P + DSP Tono/Velocidad).
+   - **Libertad total:** Ningún control se bloquea; si el usuario vuelve a activar manualmente Clonación o Diseño sobre cualquier modelo, se respeta su decisión y el backend devuelve un aviso no intrusivo en `warnings`.
 
-### 1.4. Extensión de Brave / Chrome (`extension/`)
-- El script anterior (`extension/content.js`) hacía `POST /tts` pero **nunca llamaba a `GET /download` ni creaba un elemento `<audio>`**, por lo que jamás sonaba en el navegador.
-- Ahora `extension/content.js` inyecta un widget completo con selector de modo (`Clonar Voz Base` / `Voz Nativa`), muestra el progreso y ETA en vivo consultando `GET /status`, descarga el `Blob` WAV desde `GET /download` y lo reproduce automáticamente en un reproductor `<audio controls>` HTML5.
+---
+
+## 2. Extensión Universal de Navegador v3.1 (`extension/`)
+
+- **Popup de Control Dedicado (`popup.html`, `popup.css`, `popup.js`):**
+  - Interfaz oscura moderna con indicador de conexión en vivo con el Backend (`Online • GPU` / `Offline (:8000)`) y telemetría de modelo/VRAM.
+  - **Reproducción y extensión desactivadas por defecto (`enabled: false`):** Nunca inyecta barras ni reproduce nada automáticamente al abrir pestañas hasta que el usuario la active.
+  - Controles de transporte (**⏮**, **▶ Reproducir / ⏸ Pausar**, **⏭**, **⏹**), sliders de **Volumen (0–100%)** y **Velocidad**, y selectores de Modelo, Modo, Audio Base y Voz Nativa con notificaciones transitorias de compatibilidad.
+- **Inspector DOM de Grupos de Etiquetas estilo Brave DevTools (`Ctrl+Shift+X`):**
+  - Botón punteado **🎯 Inspeccionar Grupo de Etiquetas (Ctrl+Shift+X)** en el popup y en el widget, además de campo manual de **Selector CSS** (ej. `.chapter-body p`, `article p`).
+  - Al pasar el mouse por la página, resalta contenedores y grupos de etiquetas con borde punteado azul y un tooltip que muestra el selector CSS exacto y cuántos bloques de texto contiene; al hacer clic, fija ese grupo de etiquetas para reproducir su contenido con pre-carga (*pre-fetch*).
+
+---
+
+## 3. Aceleración por GPU NVIDIA RTX 4060 y Estabilidad
+
+- **PyTorch CUDA 12.1 (`torch==2.5.1+cu121`) + Warmup CUDA:** Síntesis en `cuda:0` (`torch.float16`) en **~0.5s – 1.8s** para `OmniVoice` y decodificación `SNAC 24kHz` en GPU para modelos GGUF.
+- **Banner de Errores Persistente en Desktop UI:** Los errores nunca desaparecen solos por el polling de `/status`; cuentan con botón de copiado y cierre manual.

@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <title>Studio TTS LatAm</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="popup-card">
+    <!-- HEADER -->
+    <div class="header-row">
+      <div class="brand-box">
+        <div class="brand-icon">🎙️</div>
+        <div>
+          <div class="brand-title">Studio TTS LatAm</div>
+          <div class="brand-sub">Narrador &amp; Inspector DOM</div>
+        </div>
+      </div>
+      <div id="conn-pill" class="conn-pill offline" title="Estado de conexión con Backend local (:8000)">
+        <span class="dot"></span>
+        <span id="conn-text">Offline</span>
+      </div>
+    </div>
+
+    <!-- TOAST TRANSITORIO DE COMPATIBILIDAD -->
+    <div id="compat-toast" class="compat-toast" style="display:none;">
+      <span id="compat-toast-text"></span>
+      <button id="compat-toast-close" class="toast-close">✖</button>
+    </div>
+
+    <!-- SWITCH PRINCIPAL: ACTIVAR / DESACTIVAR EXTENSIÓN Y REPRODUCCIÓN (OFF POR DEFECTO) -->
+    <div class="section-block toggle-row">
+      <div>
+        <div class="row-title">Extensión y Reproducción</div>
+        <div class="row-sub" id="ext-state-sub">Desactivada por defecto en las pestañas</div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="sw-enable-ext" />
+        <span class="slider"></span>
+      </label>
+    </div>
+
+    <!-- BOTÓN INSPECTOR DE ETIQUETAS (ESTILO OCR SCANNER / BRAVE CTRL+SHIFT+C) -->
+    <div class="section-block">
+      <button id="btn-inspect-dom" class="inspect-cta-btn">
+        <span class="inspect-icon">🎯</span>
+        <span>Inspeccionar Grupo de Etiquetas (Ctrl+Shift+X)</span>
+      </button>
+      <div class="selector-group">
+        <input id="inp-css-selector" type="text" class="selector-input" placeholder="Selector CSS o etiqueta (ej: .chapter-body p, article p)" />
+        <button id="btn-apply-selector" class="mini-action-btn" title="Aplicar selector a la pestaña">Aplicar</button>
+      </div>
+      <div id="picked-info" class="picked-info">Contenedor actual: Auto-detección de capítulo</div>
+    </div>
+
+    <!-- CONTROLES DE REPRODUCCIÓN Y VOLUMEN (ESTILO VOLUME BOOSTER) -->
+    <div class="section-block">
+      <div class="transport-bar">
+        <button id="btn-prev" class="ctrl-btn" title="Párrafo Anterior">⏮</button>
+        <button id="btn-play-pause" class="play-main-btn">▶ Reproducir</button>
+        <button id="btn-next" class="ctrl-btn" title="Párrafo Siguiente">⏭</button>
+        <button id="btn-stop" class="ctrl-btn stop-btn" title="Detener">⏹</button>
+      </div>
+      <div id="playback-status" class="playback-status">⏹ Reproducción en espera (desactivada por defecto)</div>
+      <div class="slider-row">
+        <span class="slider-lbl">🔊 Volumen: <b id="lbl-vol">100%</b></span>
+        <input id="rng-vol" type="range" min="0" max="100" step="5" value="100" />
+      </div>
+      <div class="slider-row">
+        <span class="slider-lbl">⚡ Velocidad: <b id="lbl-speed">1.00x</b></span>
+        <input id="rng-speed" type="range" min="0.6" max="1.8" step="0.05" value="1.0" />
+      </div>
+    </div>
+
+    <!-- CONFIGURACIÓN DE MODELO Y VOZ (CON CONTROL TOTAL DEL USUARIO) -->
+    <div class="section-block">
+      <div class="field-row">
+        <label class="field-lbl">Modelo IA</label>
+        <select id="sel-model" class="field-select">
+          <option value="omnivoice-zeroshot-0.6b">OmniVoice Zero-Shot 0.6B (GPU)</option>
+          <option value="canopy-es-multivoz-q4">Canopy Orpheus Español Multi-Voz Q4</option>
+          <option value="canopy-es-ultralight-q2">Canopy Orpheus Ultra-Ligero Q2_K</option>
+          <option value="orpheus-es-conversacional-q4">Orpheus Español Conversacional Q4</option>
+        </select>
+      </div>
+
+      <div class="field-row">
+        <label class="field-lbl">Modo</label>
+        <select id="sel-mode" class="field-select">
+          <option value="clone">🎙️ Clonación de Voz (Audio Base)</option>
+          <option value="tts">🗣️ Texto a Voz (Voces Nativas)</option>
+          <option value="design">✨ Diseño de Voz (Prompt)</option>
+        </select>
+      </div>
+
+      <div class="field-row two-cols">
+        <div>
+          <label class="field-lbl">Audio Base</label>
+          <select id="sel-ref" class="field-select">
+            <option value="base_voice.mp3">base_voice.mp3</option>
+          </select>
+        </div>
+        <div>
+          <label class="field-lbl">Voz Nativa</label>
+          <select id="sel-speaker" class="field-select">
+            <option value="maria">maria</option>
+            <option value="lucia">lucia</option>
+            <option value="sofia">sofia</option>
+            <option value="tara">tara</option>
+            <option value="leah">leah</option>
+            <option value="javi">javi</option>
+            <option value="ninguna">ninguna</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="check-row">
+        <label class="check-lbl">
+          <input type="checkbox" id="chk-autoadv" checked />
+          Auto-avanzar párrafos + Pre-carga
+        </label>
+        <label class="check-lbl">
+          <input type="checkbox" id="chk-show-widget" />
+          Mostrar barra en web
+        </label>
+      </div>
+    </div>
+
+    <!-- FOOTER ESTADO HARDWARE -->
+    <div class="footer-row">
+      <span id="hw-info">Backend: http://127.0.0.1:8000</span>
+      <button id="btn-refresh-backend" class="link-btn">🔄 Sincronizar</button>
+    </div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
