@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Studio TTS LatAm Reader (Universal + WTR-Lab Novel Narrator)",
-  "version": "3.1.0",
-  "description": "Controlador y narrador universal de páginas web y novelas conectado a Studio TTS LatAm (127.0.0.1:8000) con Inspector DOM tipo DevTools (Ctrl+Shift+X), popup de control y reproducción desactivada por defecto.",
+  "version": "3.2.0",
+  "description": "Controlador y narrador universal de páginas web y novelas conectado a Studio TTS LatAm (127.0.0.1:8000) con Inspector DOM tipo DevTools (Ctrl+Shift+X), proxy background anti-bloqueo Brave Shields/CORS, popup de control y reproducción desactivada por defecto.",
   "permissions": [
     "activeTab",
     "scripting",
@@ -14,6 +14,9 @@
     "http://localhost:8000/*",
     "http://127.0.0.1:8000/*"
   ],
+  "background": {
+    "service_worker": "background.js"
+  },
   "action": {
     "default_title": "Studio TTS LatAm — Control & Inspector",
     "default_popup": "popup.html"

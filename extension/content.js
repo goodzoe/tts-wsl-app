@@ -320,6 +320,93 @@
         if (statusEl) statusEl.textContent = txt;
     }
 
+    
+    // =========================================================================
+    // CLIENTE API CON PUENTE BACKGROUND (EVITA BLOQUEO BRAVE SHIELDS / PNA / CORS)
+    // =========================================================================
+    function base64ToBlob(base64, mimeType = "audio/wav") {
+        const binStr = atob(base64);
+        const len = binStr.length;
+        const bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i++) {
+            bytes[i] = binStr.charCodeAt(i);
+        }
+        return new Blob([bytes], { type: mimeType });
+    }
+
+    async function apiJsonRequest(path, method = "GET", body = null) {
+        if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
+            try {
+                const bgRes = await new Promise((resolve) => {
+                    chrome.runtime.sendMessage(
+                        { type: "STUDIO_TTS_API_JSON", path, method, body },
+                        (resp) => {
+                            if (chrome.runtime.lastError) {
+                                resolve(null);
+                            } else {
+                                resolve(resp || null);
+                            }
+                        }
+                    );
+                });
+                if (bgRes) {
+                    if (!bgRes.ok) {
+                        const detail = (bgRes.data && bgRes.data.detail) || bgRes.error || `Error HTTP ${bgRes.status}`;
+                        throw new Error(detail);
+                    }
+                    return bgRes.data;
+                }
+            } catch (err) {
+                if (err && err.message && !err.message.includes("Network error")) {
+                    throw err;
+                }
+            }
+        }
+
+        // Fallback directo si no hay background worker disponible
+        const resp = await fetch(`${state.apiBase}${path}`, {
+            method,
+            headers: body ? { "Content-Type": "application/json" } : undefined,
+            body: body ? JSON.stringify(body) : undefined,
+            cache: "no-store"
+        });
+        if (!resp.ok) {
+            let errDetail = `Error HTTP ${resp.status}`;
+            try {
+                const errJson = await resp.json();
+                errDetail = errJson.detail || errDetail;
+            } catch (_e) {}
+            throw new Error(errDetail);
+        }
+        return await resp.json();
+    }
+
+    async function apiAudioBlobRequest(path) {
+        if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
+            const bgRes = await new Promise((resolve) => {
+                chrome.runtime.sendMessage(
+                    { type: "STUDIO_TTS_API_AUDIO", path },
+                    (resp) => {
+                        if (chrome.runtime.lastError) {
+                            resolve(null);
+                        } else {
+                            resolve(resp || null);
+                        }
+                    }
+                );
+            });
+            if (bgRes && bgRes.ok && bgRes.base64) {
+                return base64ToBlob(bgRes.base64, bgRes.mimeType || "audio/wav");
+            }
+        }
+
+        const wavResp = await fetch(`${state.apiBase}${path}`, { cache: "no-store" });
+        if (!wavResp.ok) {
+            throw new Error("No se pudo descargar el audio WAV generado.");
+        }
+        return await wavResp.blob();
+    }
+
     function requestChunkAudioBlob(index) {
         if (index < 0 || index >= state.chunks.length) {
             return Promise.reject(new Error("Índice fuera de rango"));
@@ -346,26 +433,8 @@
         };
 
         const promise = (async () => {
-            const response = await fetch(`${state.apiBase}/tts`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(payload)
-            });
-
-            if (!response.ok) {
-                let errDetail = `Error HTTP ${response.status}`;
-                try {
-                    const errJson = await response.json();
-                    errDetail = errJson.detail || errDetail;
-                } catch (_e) {}
-                throw new Error(errDetail);
-            }
-
-            const wavResp = await fetch(`${state.apiBase}/download?t=${Date.now()}_${index}`);
-            if (!wavResp.ok) {
-                throw new Error("No se pudo descargar el audio WAV generado.");
-            }
-            return await wavResp.blob();
+            await apiJsonRequest("/tts", "POST", payload);
+            return await apiAudioBlobRequest(`/download?t=${Date.now()}_${index}`);
         })();
 
         state.prefetchCache.set(index, promise);
@@ -627,6 +696,7 @@
         document.body.appendChild(widget);
         bindWidgetEvents();
         syncWithBackend();
+        setInterval(syncWithBackend, 4000);
     }
 
     async function syncWithBackend() {
@@ -634,23 +704,22 @@
         const modelSel = document.getElementById("studio-tts-model");
         const refSel = document.getElementById("studio-tts-ref");
         try {
-            const [stRes, modRes, refRes] = await Promise.all([
-                fetch(`${state.apiBase}/status`),
-                fetch(`${state.apiBase}/models`),
-                fetch(`${state.apiBase}/reference_files`)
+            const [st, mdata, rdata] = await Promise.all([
+                apiJsonRequest("/status"),
+                apiJsonRequest("/models"),
+                apiJsonRequest("/reference_files")
             ]);
-            if (stRes.ok) {
-                const st = await stRes.json();
-                const dev = st.device || "online";
-                if (badge) {
-                    badge.textContent = dev.includes("cuda") ? "⚡ GPU" : "CPU";
-                    badge.style.background = dev.includes("cuda") ? "#065f46" : "#1f2937";
-                }
+            if (st && badge) {
+                const dev = String(st.device || "online");
+                badge.textContent = dev.includes("cuda") ? "⚡ GPU" : "Online • CPU";
+                badge.style.background = dev.includes("cuda") ? "#065f46" : "#1f2937";
+                badge.style.color = "#34d399";
+                badge.style.borderColor = "#059669";
             }
-            if (modRes.ok && modelSel) {
-                const mdata = await modRes.json();
+            if (mdata && modelSel) {
                 const list = mdata.models || [];
                 if (list.length > 0) {
+                    const prevVal = modelSel.value;
                     modelSel.innerHTML = "";
                     state.modelsMeta = {};
                     for (const m of list) {
@@ -660,16 +729,18 @@
                         opt.textContent = m.name;
                         modelSel.appendChild(opt);
                     }
-                    if (mdata.loaded_model_id && state.modelsMeta[mdata.loaded_model_id]) {
+                    if (prevVal && state.modelsMeta[prevVal]) {
+                        modelSel.value = prevVal;
+                    } else if (mdata.loaded_model_id && state.modelsMeta[mdata.loaded_model_id]) {
                         state.modelId = mdata.loaded_model_id;
                         modelSel.value = mdata.loaded_model_id;
                     }
                 }
             }
-            if (refRes.ok && refSel) {
-                const rdata = await refRes.json();
+            if (rdata && refSel) {
                 const files = rdata.files || [];
                 if (files.length > 0) {
+                    const prevRef = refSel.value;
                     refSel.innerHTML = "";
                     for (const f of files) {
                         const opt = document.createElement("option");
@@ -677,12 +748,15 @@
                         opt.textContent = `${f.name} (${f.duration}s)`;
                         refSel.appendChild(opt);
                     }
+                    if (prevRef) refSel.value = prevRef;
                 }
             }
         } catch (_e) {
             if (badge) {
                 badge.textContent = "Offline";
                 badge.style.background = "#7f1d1d";
+                badge.style.color = "#fecaca";
+                badge.style.borderColor = "#b91c1c";
             }
         }
     }
@@ -836,12 +910,9 @@
             if (state.statusPollTimer) clearInterval(state.statusPollTimer);
             state.statusPollTimer = setInterval(async () => {
                 try {
-                    const stRes = await fetch(`${state.apiBase}/status`);
-                    if (stRes.ok) {
-                        const st = await stRes.json();
-                        if (st.status === "GENERATING" && st.message) {
-                            setStatusText(st.message);
-                        }
+                    const st = await apiJsonRequest("/status");
+                    if (st && st.status === "GENERATING" && st.message) {
+                        setStatusText(st.message);
                     }
                 } catch (_e) {}
             }, 900);
