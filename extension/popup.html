@@ -53,7 +53,7 @@
       <div id="picked-info" class="picked-info">Contenedor actual: Auto-detección de capítulo</div>
     </div>
 
-    <!-- CONTROLES DE REPRODUCCIÓN Y VOLUMEN (ESTILO VOLUME BOOSTER) -->
+    <!-- CONTROLES DE REPRODUCCIÓN, VOLUMEN Y VELOCIDAD EN TIEMPO REAL -->
     <div class="section-block">
       <div class="transport-bar">
         <button id="btn-prev" class="ctrl-btn" title="Párrafo Anterior">⏮</button>
@@ -67,8 +67,8 @@
         <input id="rng-vol" type="range" min="0" max="100" step="5" value="100" />
       </div>
       <div class="slider-row">
-        <span class="slider-lbl">⚡ Velocidad: <b id="lbl-speed">1.00x</b></span>
-        <input id="rng-speed" type="range" min="0.6" max="1.8" step="0.05" value="1.0" />
+        <span class="slider-lbl" title="Modifica instantáneamente la velocidad del audio en reproducción">⚡ Velocidad Audio: <b id="lbl-speed">1.00x</b></span>
+        <input id="rng-speed" type="range" min="0.5" max="2.5" step="0.05" value="1.0" />
       </div>
     </div>
 
@@ -117,11 +117,7 @@
       <div class="check-row">
         <label class="check-lbl">
           <input type="checkbox" id="chk-autoadv" checked />
-          Auto-avanzar párrafos + Pre-carga
-        </label>
-        <label class="check-lbl">
-          <input type="checkbox" id="chk-show-widget" />
-          Mostrar barra en web
+          Auto-avanzar párrafos + Pre-generación activa
         </label>
       </div>
     </div>

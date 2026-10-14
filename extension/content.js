@@ -1,13 +1,20 @@
 /**
- * Studio TTS LatAm — Extensión Universal y Narrador de Novelas (WTR-Lab & Web) v3.1
+ * Studio TTS LatAm — Motor Content Script Limpio v3.3
  *
- * - Reproducción y barra flotante DESACTIVADAS por defecto para nunca ser intrusivas.
- * - Inspector DOM tipo Brave DevTools (Ctrl+Shift+X o desde el Popup/Widget):
- *   resalta contenedores/grupos de etiquetas al pasar el mouse, muestra el selector CSS
- *   y la cantidad de bloques detectados, y al hacer clic extrae únicamente ese grupo.
- * - Sincronizado en tiempo real con popup.html/popup.js y con el Backend local (127.0.0.1:8000).
- * - Respeta el control total del usuario sobre modelos y modos, avisando con toast transitorio
- *   si se elige un modelo GGUF sin soporte Zero-Shot nativo.
+ * 1. CERO CONEXIONES DIRECTAS A LOCALHOST DESDE LA PÁGINA WEB:
+ *    Elimina por completo el cartel de Chrome/Brave "<sitio> quiere acceder a otras aplicaciones
+ *    y servicios de este dispositivo" (Private Network Access). Todas las llamadas a 127.0.0.1:8000
+ *    ocurren exclusivamente dentro del Service Worker (background.js).
+ * 2. CERO BARRAS FLOTANTES EN LA PÁGINA:
+ *    Todo el control vive en el menú desplegable de la extensión (popup.html). No se inyecta
+ *    ningún widget que tape contenido.
+ * 3. VELOCIDAD EN TIEMPO REAL SOBRE EL AUDIO ACTUAL:
+ *    El slider de velocidad ajusta instantáneamente `audioEl.playbackRate` (y `preservesPitch = true`)
+ *    sobre el audio que está sonando sin re-generarlo ni distorsionar el tono.
+ * 4. PRE-GENERACIÓN ACTIVA (PREFETCH QUEUE):
+ *    En cuanto el fragmento `idx` queda listo y empieza a sonar, lanza una cola secuencial en
+ *    segundo plano que pre-genera activamente `idx + 1` e `idx + 2` en el backend GPU para que la
+ *    transición entre párrafos sea inmediata (0 ms de espera).
  */
 
 (function () {
@@ -16,7 +23,9 @@
     if (window.__studioTtsLatAmInjected) return;
     window.__studioTtsLatAmInjected = true;
 
-    const DEFAULT_API_BASE = "http://127.0.0.1:8000";
+    // Eliminar cualquier widget viejo si quedó de una versión previa sin recargar pestaña
+    const legacyWidget = document.getElementById("studio-tts-widget");
+    if (legacyWidget) legacyWidget.remove();
 
     const NOVEL_CONTAINER_SELECTORS = [
         ".chapter-body",
@@ -37,7 +46,7 @@
     const NOISE_SELECTORS = [
         "nav", "header", "footer", "aside", "script", "style", "noscript", "svg", "iframe",
         "button", "select", "input", "textarea", "form",
-        ".studio-tts-widget", ".ads", ".ad", ".advertisement", "[class*='advert']",
+        ".ads", ".ad", ".advertisement", "[class*='advert']",
         ".comments", "#comments", ".comment-section", ".disqus",
         ".chapter-nav", ".chapter-actions", ".pagination", ".pager", ".breadcrumb",
         ".toc", ".table-of-contents", ".sidebar", ".social-share", ".share-buttons",
@@ -45,10 +54,7 @@
     ];
 
     const state = {
-        apiBase: DEFAULT_API_BASE,
-        enabled: false,         // Desactivada por defecto
-        showWidget: false,      // No mostrar widget flotante hasta que el usuario active la extensión
-        minimized: false,
+        enabled: false,         // Reproducción desactivada por defecto
         pickingElement: false,
         customContainer: null,
         cssSelector: "",
@@ -60,25 +66,89 @@
         stopRequested: false,
         autoAdvance: true,
         volume: 1.0,
-        sourceMode: "chapter", // "chapter" | "selection" | "picked" | "selector"
-        ttsMode: "clone",      // "clone" | "tts" | "design"
+        playbackRate: 1.0,      // Velocidad de reproducción en tiempo real sobre el audio actual
+        ttsMode: "clone",       // "clone" | "tts" | "design"
         modelId: "omnivoice-zeroshot-0.6b",
         referenceFile: "base_voice.mp3",
         speakerHint: "maria",
         voiceDescription: "Voz femenina joven de 23 años, cálida, clara y natural con acento argentino",
         styleInstruct: "",
-        speed: 1.0,
         numStep: 12,
         chunkSize: 320,
-        prefetchCache: new Map(),
+        prefetchLookahead: 2,   // Pre-generar activamente los siguientes 2 fragmentos
+        prefetchCache: new Map(), // index -> Promise<Blob>
+        prefetchStatuses: new Map(), // index -> "queued" | "generating" | "ready" | "error"
+        synthesisChain: Promise.resolve(), // Cola secuencial para no colisionar en el backend
         activeBlobUrl: null,
         highlightedEl: null,
         inspectorHoverEl: null,
         inspectorTooltipEl: null,
-        statusPollTimer: null,
-        statusText: "⏹ Reproducción en espera (desactivada por defecto)",
-        modelsMeta: {}
+        statusText: "⏹ Reproducción en espera (desactivada por defecto)"
     };
+
+    // Elemento de audio en memoria (oculto, jamás visible en el DOM)
+    const audioEl = new Audio();
+    audioEl.preload = "auto";
+    if ("preservesPitch" in audioEl) audioEl.preservesPitch = true;
+    if ("mozPreservesPitch" in audioEl) audioEl.mozPreservesPitch = true;
+    if ("webkitPreservesPitch" in audioEl) audioEl.webkitPreservesPitch = true;
+
+    function base64ToBlob(base64, mimeType = "audio/wav") {
+        const binStr = atob(base64);
+        const len = binStr.length;
+        const bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i++) {
+            bytes[i] = binStr.charCodeAt(i);
+        }
+        return new Blob([bytes], { type: mimeType });
+    }
+
+    /**
+     * Comunicación 100% vía Background Service Worker (NUNCA hace fetch desde la página web).
+     * Esto evita que aparezca el popup de permiso de red local de Chrome/Brave en las pestañas.
+     */
+    function bgApiJsonRequest(path, method = "GET", body = null) {
+        return new Promise((resolve, reject) => {
+            if (typeof chrome === "undefined" || !chrome.runtime || !chrome.runtime.sendMessage) {
+                reject(new Error("Extensión recargada. Actualiza la pestaña (F5)."));
+                return;
+            }
+            chrome.runtime.sendMessage(
+                { type: "STUDIO_TTS_API_JSON", path, method, body },
+                (resp) => {
+                    if (chrome.runtime.lastError) {
+                        reject(new Error("Backend o extensión no disponible."));
+                        return;
+                    }
+                    if (!resp || !resp.ok) {
+                        const detail = (resp && resp.data && resp.data.detail) || (resp && resp.error) || "Backend offline (:8000)";
+                        reject(new Error(detail));
+                        return;
+                    }
+                    resolve(resp.data);
+                }
+            );
+        });
+    }
+
+    function bgApiAudioBlobRequest(path) {
+        return new Promise((resolve, reject) => {
+            if (typeof chrome === "undefined" || !chrome.runtime || !chrome.runtime.sendMessage) {
+                reject(new Error("Extensión recargada. Actualiza la pestaña (F5)."));
+                return;
+            }
+            chrome.runtime.sendMessage(
+                { type: "STUDIO_TTS_API_AUDIO", path },
+                (resp) => {
+                    if (chrome.runtime.lastError || !resp || !resp.ok || !resp.base64) {
+                        reject(new Error((resp && resp.error) || "No se pudo descargar el audio WAV generado."));
+                        return;
+                    }
+                    resolve(base64ToBlob(resp.base64, resp.mimeType || "audio/wav"));
+                }
+            );
+        });
+    }
 
     function isCleanNarrativeParagraph(text) {
         if (!text) return false;
@@ -122,7 +192,6 @@
         for (const sel of NOVEL_CONTAINER_SELECTORS) {
             const candidates = Array.from(document.querySelectorAll(sel));
             for (const el of candidates) {
-                if (el.closest("#studio-tts-widget")) continue;
                 const textLen = (el.innerText || "").trim().length;
                 if (textLen > 250) {
                     return el;
@@ -135,7 +204,6 @@
         const containers = document.querySelectorAll("article, main, section, div");
 
         for (const el of containers) {
-            if (el.closest("#studio-tts-widget")) continue;
             const pList = el.querySelectorAll(":scope > p, :scope > div > p");
             if (pList.length < 2) continue;
 
@@ -158,10 +226,47 @@
         return bestEl;
     }
 
+    function splitTextIntoNaturalChunks(text, maxChars = 320) {
+        const clean = text.replace(/\s+/g, " ").trim();
+        if (!clean) return [];
+        if (clean.length <= maxChars) return [clean];
+
+        const sentences = clean.match(/[^.!?…]+[.!?…]+["'»”)]*|.+/g) || [clean];
+        const chunks = [];
+        let current = "";
+
+        for (const rawSent of sentences) {
+            const sent = rawSent.trim();
+            if (!sent) continue;
+
+            if ((current + " " + sent).trim().length <= maxChars) {
+                current = (current + " " + sent).trim();
+            } else {
+                if (current) chunks.push(current);
+                if (sent.length <= maxChars) {
+                    current = sent;
+                } else {
+                    const parts = sent.split(/([,;:])/);
+                    let sub = "";
+                    for (const part of parts) {
+                        if ((sub + part).length <= maxChars) {
+                            sub += part;
+                        } else {
+                            if (sub.trim()) chunks.push(sub.trim());
+                            sub = part;
+                        }
+                    }
+                    current = sub.trim();
+                }
+            }
+        }
+        if (current) chunks.push(current);
+        return chunks;
+    }
+
     function extractChapterChunks(maxChars = 320) {
         const selText = window.getSelection ? window.getSelection().toString().trim() : "";
-        if (state.sourceMode === "selection" || selText.length > 15) {
-            if (!selText) return [];
+        if (selText.length > 15) {
             return splitTextIntoNaturalChunks(selText, maxChars).map((text) => ({
                 text,
                 element: null
@@ -171,11 +276,10 @@
         const noiseSelectorJoined = NOISE_SELECTORS.join(", ");
         const paragraphs = [];
 
-        // Si el usuario definió un selector CSS de grupo de etiquetas (ej: ".chapter-body p" o "article p")
         if (state.cssSelector && state.cssSelector.trim()) {
             try {
                 const matchedNodes = Array.from(document.querySelectorAll(state.cssSelector.trim()))
-                    .filter((n) => !n.closest("#studio-tts-widget") && !n.closest(noiseSelectorJoined));
+                    .filter((n) => !n.closest(noiseSelectorJoined));
                 if (matchedNodes.length === 1) {
                     const singleContainer = matchedNodes[0];
                     const innerBlocks = singleContainer.querySelectorAll("h1, h2, h3, p, blockquote, li");
@@ -247,44 +351,6 @@
         return finalChunks;
     }
 
-    function splitTextIntoNaturalChunks(text, maxChars = 320) {
-        const clean = text.replace(/\s+/g, " ").trim();
-        if (!clean) return [];
-        if (clean.length <= maxChars) return [clean];
-
-        const sentences = clean.match(/[^.!?…]+[.!?…]+["'»”)]*|.+/g) || [clean];
-        const chunks = [];
-        let current = "";
-
-        for (const rawSent of sentences) {
-            const sent = rawSent.trim();
-            if (!sent) continue;
-
-            if ((current + " " + sent).trim().length <= maxChars) {
-                current = (current + " " + sent).trim();
-            } else {
-                if (current) chunks.push(current);
-                if (sent.length <= maxChars) {
-                    current = sent;
-                } else {
-                    const parts = sent.split(/([,;:])/);
-                    let sub = "";
-                    for (const part of parts) {
-                        if ((sub + part).length <= maxChars) {
-                            sub += part;
-                        } else {
-                            if (sub.trim()) chunks.push(sub.trim());
-                            sub = part;
-                        }
-                    }
-                    current = sub.trim();
-                }
-            }
-        }
-        if (current) chunks.push(current);
-        return chunks;
-    }
-
     function highlightActiveElement(el) {
         if (state.highlightedEl && state.highlightedEl !== el) {
             state.highlightedEl.classList.remove("studio-tts-active-paragraph");
@@ -314,100 +380,18 @@
         }
     }
 
-    function setStatusText(txt) {
-        state.statusText = txt;
-        const statusEl = document.getElementById("studio-tts-status");
-        if (statusEl) statusEl.textContent = txt;
+    function invalidatePrefetchCache() {
+        state.prefetchCache.clear();
+        state.prefetchStatuses.clear();
     }
 
-    
-    // =========================================================================
-    // CLIENTE API CON PUENTE BACKGROUND (EVITA BLOQUEO BRAVE SHIELDS / PNA / CORS)
-    // =========================================================================
-    function base64ToBlob(base64, mimeType = "audio/wav") {
-        const binStr = atob(base64);
-        const len = binStr.length;
-        const bytes = new Uint8Array(len);
-        for (let i = 0; i < len; i++) {
-            bytes[i] = binStr.charCodeAt(i);
-        }
-        return new Blob([bytes], { type: mimeType });
-    }
-
-    async function apiJsonRequest(path, method = "GET", body = null) {
-        if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
-            try {
-                const bgRes = await new Promise((resolve) => {
-                    chrome.runtime.sendMessage(
-                        { type: "STUDIO_TTS_API_JSON", path, method, body },
-                        (resp) => {
-                            if (chrome.runtime.lastError) {
-                                resolve(null);
-                            } else {
-                                resolve(resp || null);
-                            }
-                        }
-                    );
-                });
-                if (bgRes) {
-                    if (!bgRes.ok) {
-                        const detail = (bgRes.data && bgRes.data.detail) || bgRes.error || `Error HTTP ${bgRes.status}`;
-                        throw new Error(detail);
-                    }
-                    return bgRes.data;
-                }
-            } catch (err) {
-                if (err && err.message && !err.message.includes("Network error")) {
-                    throw err;
-                }
-            }
-        }
-
-        // Fallback directo si no hay background worker disponible
-        const resp = await fetch(`${state.apiBase}${path}`, {
-            method,
-            headers: body ? { "Content-Type": "application/json" } : undefined,
-            body: body ? JSON.stringify(body) : undefined,
-            cache: "no-store"
-        });
-        if (!resp.ok) {
-            let errDetail = `Error HTTP ${resp.status}`;
-            try {
-                const errJson = await resp.json();
-                errDetail = errJson.detail || errDetail;
-            } catch (_e) {}
-            throw new Error(errDetail);
-        }
-        return await resp.json();
-    }
-
-    async function apiAudioBlobRequest(path) {
-        if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
-            const bgRes = await new Promise((resolve) => {
-                chrome.runtime.sendMessage(
-                    { type: "STUDIO_TTS_API_AUDIO", path },
-                    (resp) => {
-                        if (chrome.runtime.lastError) {
-                            resolve(null);
-                        } else {
-                            resolve(resp || null);
-                        }
-                    }
-                );
-            });
-            if (bgRes && bgRes.ok && bgRes.base64) {
-                return base64ToBlob(bgRes.base64, bgRes.mimeType || "audio/wav");
-            }
-        }
-
-        const wavResp = await fetch(`${state.apiBase}${path}`, { cache: "no-store" });
-        if (!wavResp.ok) {
-            throw new Error("No se pudo descargar el audio WAV generado.");
-        }
-        return await wavResp.blob();
-    }
-
-    function requestChunkAudioBlob(index) {
+    /**
+     * Encola la síntesis y descarga del fragmento `index` de manera estrictamente secuencial
+     * para que la pre-generación (prefetch) de `idx + 1` e `idx + 2` nunca colisione ni pise
+     * el archivo WAV en el servidor.
+     * NOTA: `speed` al backend se envía siempre en 1.0; la velocidad del popup controla `audioEl.playbackRate` en vivo.
+     */
+    function enqueueChunkSynthesis(index) {
         if (index < 0 || index >= state.chunks.length) {
             return Promise.reject(new Error("Índice fuera de rango"));
         }
@@ -416,6 +400,8 @@
         }
 
         const chunkObj = state.chunks[index];
+        state.prefetchStatuses.set(index, "queued");
+
         const payload = {
             text: chunkObj.text,
             mode: state.ttsMode,
@@ -427,25 +413,156 @@
             voice_description: state.voiceDescription,
             num_step: Number(state.numStep) || 12,
             guidance_scale: 2.0,
-            speed: Number(state.speed) || 1.0,
+            speed: 1.0, // La velocidad del usuario se aplica en tiempo real sobre audioEl.playbackRate
             temperature: 0.6,
             top_k: 50
         };
 
-        const promise = (async () => {
-            await apiJsonRequest("/tts", "POST", payload);
-            return await apiAudioBlobRequest(`/download?t=${Date.now()}_${index}`);
-        })();
-
-        state.prefetchCache.set(index, promise);
-        promise.catch(() => {
-            state.prefetchCache.delete(index);
+        const taskPromise = state.synthesisChain.then(async () => {
+            if (state.stopRequested) {
+                throw new Error("Reproducción detenida");
+            }
+            state.prefetchStatuses.set(index, "generating");
+            await bgApiJsonRequest("/tts", "POST", payload);
+            const blob = await bgApiAudioBlobRequest(`/download?t=${Date.now()}_${index}`);
+            state.prefetchStatuses.set(index, "ready");
+            return blob;
         });
-        return promise;
+
+        // Mantener viva la cadena aunque un eslabón falle
+        state.synthesisChain = taskPromise.catch(() => {});
+
+        state.prefetchCache.set(index, taskPromise);
+        taskPromise.catch(() => {
+            state.prefetchCache.delete(index);
+            state.prefetchStatuses.set(index, "error");
+        });
+
+        return taskPromise;
+    }
+
+    /**
+     * Dispara activamente la pre-generación en segundo plano de los siguientes N fragmentos
+     * mientras el usuario escucha el fragmento actual.
+     */
+    function triggerActivePrefetch(fromIndex) {
+        if (!state.autoAdvance || state.stopRequested) return;
+        const maxLookahead = state.prefetchLookahead || 2;
+        for (let offset = 1; offset <= maxLookahead; offset++) {
+            const targetIdx = fromIndex + offset;
+            if (targetIdx < state.chunks.length && !state.prefetchCache.has(targetIdx)) {
+                enqueueChunkSynthesis(targetIdx).catch(() => {});
+            }
+        }
+    }
+
+    async function playChunkAtIndex(idx) {
+        if (state.stopRequested || idx < 0 || idx >= state.chunks.length) {
+            finishPlayback();
+            return;
+        }
+
+        state.currentIndex = idx;
+        const currentChunk = state.chunks[idx];
+        highlightActiveElement(currentChunk.element);
+
+        const wasAlreadyPrefetched = state.prefetchStatuses.get(idx) === "ready";
+        state.statusText = wasAlreadyPrefetched
+            ? `⚡ Cargando desde caché párrafo ${idx + 1}/${state.chunks.length}...`
+            : `⏳ Sintetizando párrafo ${idx + 1} de ${state.chunks.length}...`;
+
+        try {
+            const wavBlob = await enqueueChunkSynthesis(idx);
+            if (state.stopRequested || state.currentIndex !== idx) return;
+
+            // Pre-generar activamente los siguientes fragmentos (idx+1, idx+2) mientras suena este
+            triggerActivePrefetch(idx);
+
+            revokeActiveBlob();
+            const blobUrl = URL.createObjectURL(wavBlob);
+            state.activeBlobUrl = blobUrl;
+
+            audioEl.src = blobUrl;
+            audioEl.volume = Math.max(0, Math.min(1, Number(state.volume ?? 1.0)));
+            audioEl.playbackRate = Math.max(0.4, Math.min(3.0, Number(state.playbackRate ?? 1.0)));
+
+            audioEl.onended = () => {
+                revokeActiveBlob();
+                if (!state.stopRequested && state.autoAdvance && state.currentIndex + 1 < state.chunks.length) {
+                    playChunkAtIndex(state.currentIndex + 1);
+                } else {
+                    finishPlayback();
+                }
+            };
+
+            state.isPlaying = true;
+            state.isPaused = false;
+            const nextStatus = state.prefetchStatuses.get(idx + 1);
+            const prefetchTag = (idx + 1 < state.chunks.length)
+                ? (nextStatus === "ready" ? " • ⚡ Siguiente listo" : " • 🔄 Pre-generando sig.")
+                : "";
+            state.statusText = `🔊 Narrando [${idx + 1}/${state.chunks.length}] (${state.playbackRate.toFixed(2)}x)${prefetchTag}`;
+
+            await audioEl.play();
+        } catch (err) {
+            if (state.stopRequested) return;
+            state.statusText = `❌ ${err.message || "Backend offline en 127.0.0.1:8000"}`;
+            state.isPlaying = false;
+        }
+    }
+
+    function finishPlayback() {
+        state.isPlaying = false;
+        state.isPaused = false;
+        clearHighlight();
+        state.statusText = "✅ Lectura finalizada";
+    }
+
+    function startOrResumePlayback(forceRestart = false) {
+        if (!forceRestart && state.isPlaying && !state.isPaused && !audioEl.paused) {
+            audioEl.pause();
+            state.isPaused = true;
+            state.statusText = `⏸ Pausado en [${state.currentIndex + 1}/${state.chunks.length}]`;
+            return;
+        }
+
+        if (!forceRestart && state.isPlaying && state.isPaused) {
+            state.isPaused = false;
+            audioEl.playbackRate = Math.max(0.4, Math.min(3.0, Number(state.playbackRate ?? 1.0)));
+            state.statusText = `🔊 Narrando [${state.currentIndex + 1}/${state.chunks.length}] (${state.playbackRate.toFixed(2)}x)`;
+            audioEl.play();
+            return;
+        }
+
+        state.stopRequested = false;
+        if (state.chunks.length === 0 || forceRestart) {
+            state.chunks = extractChapterChunks(state.chunkSize);
+            if (!forceRestart) state.currentIndex = 0;
+        }
+
+        if (state.chunks.length === 0) {
+            state.statusText = "⚠️ No se detectó texto narrativo en esta página.";
+            return;
+        }
+
+        playChunkAtIndex(state.currentIndex);
+    }
+
+    function stopPlayback() {
+        state.stopRequested = true;
+        state.isPlaying = false;
+        state.isPaused = false;
+        try {
+            audioEl.pause();
+            audioEl.currentTime = 0;
+        } catch (_e) {}
+        revokeActiveBlob();
+        clearHighlight();
+        state.statusText = "⏹ Lectura detenida";
     }
 
     // =========================================================================
-    // INSPECTOR DOM ESTILO BRAVE DEVTOOLS (Ctrl+Shift+X / Botón Inspector)
+    // INSPECTOR DOM ESTILO BRAVE DEVTOOLS (Ctrl+Shift+X o desde el Popup)
     // =========================================================================
     function ensureInspectorTooltip() {
         if (!state.inspectorTooltipEl) {
@@ -459,17 +576,12 @@
     }
 
     function startDomInspector() {
-        ensureWidgetExists();
         state.pickingElement = true;
-        const pickBtn = document.getElementById("studio-tts-pick-btn");
-        if (pickBtn) pickBtn.classList.add("active");
-        setStatusText("🎯 Inspector DOM activo (ESC para cancelar): pasa el mouse y haz clic en el grupo de etiquetas...");
+        state.statusText = "🎯 Inspector DOM activo (ESC para cancelar): haz clic en el grupo de etiquetas...";
     }
 
     function stopDomInspector() {
         state.pickingElement = false;
-        const pickBtn = document.getElementById("studio-tts-pick-btn");
-        if (pickBtn) pickBtn.classList.remove("active");
         if (state.inspectorHoverEl) {
             state.inspectorHoverEl.classList.remove("studio-tts-inspector-highlight");
             state.inspectorHoverEl = null;
@@ -482,7 +594,7 @@
     document.addEventListener("mousemove", (ev) => {
         if (!state.pickingElement) return;
         const target = ev.target;
-        if (!target || target.closest("#studio-tts-widget") || target.classList.contains("studio-tts-inspector-tooltip")) {
+        if (!target || target.classList.contains("studio-tts-inspector-tooltip")) {
             return;
         }
         const candidate = target.closest("article, section, main, .chapter-body, .chapter-content, div, p, ul, ol, blockquote") || target;
@@ -506,29 +618,25 @@
             ev.preventDefault();
             if (state.pickingElement) {
                 stopDomInspector();
-                setStatusText("Modo Inspector DOM cancelado.");
+                state.statusText = "Modo Inspector DOM cancelado.";
             } else {
                 state.enabled = true;
-                state.showWidget = true;
-                updateWidgetVisibility();
                 startDomInspector();
             }
         } else if (ev.key === "Escape" && state.pickingElement) {
             stopDomInspector();
-            setStatusText("Modo Inspector DOM cancelado.");
+            state.statusText = "Modo Inspector DOM cancelado.";
         }
     }, true);
 
     document.addEventListener("click", (ev) => {
         if (!state.pickingElement) return;
-        if (ev.target.closest("#studio-tts-widget")) return;
         ev.preventDefault();
         ev.stopPropagation();
 
         const clickedEl = state.inspectorHoverEl || ev.target;
         stopDomInspector();
 
-        // Determinar si el usuario clickeó un párrafo individual dentro de un grupo o un contenedor
         const isParagraph = ["P", "LI", "BLOCKQUOTE", "H1", "H2", "H3"].includes(clickedEl.tagName);
         const container = isParagraph
             ? (clickedEl.closest(".chapter-body, .chapter-content, #chapter-content, article, section, main, div") || clickedEl.parentElement)
@@ -538,13 +646,9 @@
         const containerSel = buildCssSelectorForElement(container);
         state.cssSelector = isParagraph ? `${containerSel} ${clickedEl.tagName.toLowerCase()}` : containerSel;
         state.selectorDescription = state.cssSelector;
-        state.sourceMode = "picked";
-
-        const sourceSel = document.getElementById("studio-tts-source");
-        if (sourceSel) sourceSel.value = "picked";
 
         state.chunks = extractChapterChunks(state.chunkSize);
-        state.prefetchCache.clear();
+        invalidatePrefetchCache();
 
         let foundIdx = 0;
         if (isParagraph) {
@@ -555,12 +659,10 @@
             }
         }
         state.currentIndex = foundIdx;
-        setStatusText(`🎯 Grupo seleccionado (${state.cssSelector}): ${state.chunks.length} bloques listos (En espera, pulsa ▶ para reproducir)`);
-
-        const previewEl = document.getElementById("studio-tts-preview");
-        if (previewEl && state.chunks[foundIdx]) {
-            previewEl.textContent = `[${foundIdx + 1}/${state.chunks.length}] ${state.chunks[foundIdx].text.slice(0, 110)}...`;
+        if (state.chunks[foundIdx] && state.chunks[foundIdx].element) {
+            highlightActiveElement(state.chunks[foundIdx].element);
         }
+        state.statusText = `🎯 Grupo seleccionado (${state.cssSelector}): ${state.chunks.length} bloques listos desde #${foundIdx + 1}`;
 
         if (typeof chrome !== "undefined" && chrome.storage && chrome.storage.local) {
             chrome.storage.local.get(["studioTtsConfig"], (res) => {
@@ -572,512 +674,58 @@
     }, true);
 
     // =========================================================================
-    // WIDGET FLOTANTE Y CONTROLES DE REPRODUCCIÓN
-    // =========================================================================
-    function ensureWidgetExists() {
-        if (!document.getElementById("studio-tts-widget")) {
-            createFloatingWidget();
-        }
-    }
-
-    function updateWidgetVisibility() {
-        ensureWidgetExists();
-        const w = document.getElementById("studio-tts-widget");
-        if (!w) return;
-        w.style.display = (state.enabled && state.showWidget) ? "block" : "none";
-    }
-
-    function createFloatingWidget() {
-        if (document.getElementById("studio-tts-widget")) return;
-
-        const widget = document.createElement("div");
-        widget.id = "studio-tts-widget";
-        widget.className = "studio-tts-widget";
-        widget.style.display = (state.enabled && state.showWidget) ? "block" : "none";
-
-        widget.innerHTML = `
-            <div class="studio-tts-header" id="studio-tts-drag-handle">
-                <div class="studio-tts-brand">
-                    <span class="studio-tts-title">🎙️ Studio TTS LatAm</span>
-                    <span id="studio-tts-badge" class="studio-tts-badge">v3.1</span>
-                </div>
-                <div class="studio-tts-header-btns">
-                    <button id="studio-tts-pick-btn" class="studio-tts-icon-btn" title="Inspeccionar grupo de etiquetas (Ctrl+Shift+X)">🎯</button>
-                    <button id="studio-tts-cfg-btn" class="studio-tts-icon-btn" title="Mostrar/Ocultar Ajustes Avanzados">⚙️</button>
-                    <button id="studio-tts-min-btn" class="studio-tts-icon-btn" title="Minimizar/Expandir">➖</button>
-                </div>
-            </div>
-
-            <div id="studio-tts-body" class="studio-tts-body">
-                <div class="studio-tts-row">
-                    <select id="studio-tts-source" class="studio-tts-select" title="Qué contenido leer de la página">
-                        <option value="chapter" selected>📖 Narrar Capítulo / Artículo Limpio</option>
-                        <option value="selection">✂️ Solo Texto Seleccionado</option>
-                        <option value="picked">🎯 Grupo Inspeccionado (Ctrl+Shift+X)</option>
-                    </select>
-                    <select id="studio-tts-mode" class="studio-tts-select" title="Modo de Síntesis">
-                        <option value="clone" selected>🎙️ Clonar Voz</option>
-                        <option value="tts">🗣️ Voz Nativa</option>
-                        <option value="design">✨ Diseño Voz</option>
-                    </select>
-                </div>
-
-                <div id="studio-tts-adv-panel" class="studio-tts-adv-panel" style="display:none;">
-                    <div class="studio-tts-field">
-                        <label>Selector CSS de Etiquetas:</label>
-                        <input id="studio-tts-css-input" type="text" class="studio-tts-input" placeholder="Ej: .chapter-body p, article p" />
-                    </div>
-                    <div class="studio-tts-field">
-                        <label>Modelo IA:</label>
-                        <select id="studio-tts-model" class="studio-tts-select-full">
-                            <option value="omnivoice-zeroshot-0.6b">OmniVoice Zero-Shot 0.6B (GPU Rápido)</option>
-                            <option value="canopy-es-multivoz-q4">Canopy Orpheus Español Multi-Voz Q4</option>
-                            <option value="canopy-es-ultralight-q2">Canopy Orpheus Ultra-Ligero Q2_K</option>
-                            <option value="orpheus-es-conversacional-q4">Orpheus Español Conversacional Q4</option>
-                        </select>
-                    </div>
-                    <div class="studio-tts-row">
-                        <div class="studio-tts-field" style="flex:1;">
-                            <label>Audio Base (Clon):</label>
-                            <select id="studio-tts-ref" class="studio-tts-select-full">
-                                <option value="base_voice.mp3">base_voice.mp3</option>
-                            </select>
-                        </div>
-                        <div class="studio-tts-field" style="width:95px;">
-                            <label>Voz Nativa:</label>
-                            <select id="studio-tts-speaker" class="studio-tts-select-full">
-                                <option value="maria">maria</option>
-                                <option value="lucia">lucia</option>
-                                <option value="sofia">sofia</option>
-                                <option value="tara">tara</option>
-                                <option value="leah">leah</option>
-                                <option value="javi">javi</option>
-                                <option value="ninguna">ninguna</option>
-                            </select>
-                        </div>
-                    </div>
-                    <div class="studio-tts-row">
-                        <div class="studio-tts-field" style="flex:1;">
-                            <label>Velocidad: <span id="studio-tts-speed-val">1.0x</span></label>
-                            <input id="studio-tts-speed" type="range" min="0.7" max="1.6" step="0.05" value="1.0" />
-                        </div>
-                        <div class="studio-tts-field" style="flex:1;">
-                            <label>Pasos (Rapidez): <span id="studio-tts-steps-val">12</span></label>
-                            <input id="studio-tts-steps" type="range" min="6" max="24" step="2" value="12" />
-                        </div>
-                    </div>
-                    <div class="studio-tts-field">
-                        <label>Prompt Diseño / Estilo:</label>
-                        <input id="studio-tts-prompt" type="text" class="studio-tts-input" placeholder="Ej: voz femenina cálida, narración expresiva" value="Voz femenina joven de 23 años, cálida, clara y natural con acento argentino" />
-                    </div>
-                    <div class="studio-tts-row" style="justify-content:space-between; align-items:center;">
-                        <label class="studio-tts-check-label">
-                            <input id="studio-tts-autoadv" type="checkbox" checked />
-                            Continuar siguiente párrafo + Pre-cargar
-                        </label>
-                        <button id="studio-tts-scan-btn" class="studio-tts-mini-btn" title="Re-escanear párrafos de la página">🔄 Escanear</button>
-                    </div>
-                </div>
-
-                <div id="studio-tts-status" class="studio-tts-status">⏹ Reproducción desactivada por defecto • Pulsa ▶ para iniciar</div>
-                <div id="studio-tts-preview" class="studio-tts-preview"></div>
-
-                <div class="studio-tts-transport">
-                    <button id="studio-tts-prev-btn" class="studio-tts-ctrl-btn" title="Párrafo Anterior">⏮</button>
-                    <button id="local-tts-play-btn" class="tts-floating-btn">▶ Narrar Capítulo</button>
-                    <button id="studio-tts-next-btn" class="studio-tts-ctrl-btn" title="Párrafo Siguiente">⏭</button>
-                    <button id="studio-tts-stop-btn" class="studio-tts-ctrl-btn studio-tts-stop" title="Detener">⏹</button>
-                </div>
-
-                <audio id="studio-tts-audio" class="studio-tts-audio" controls preload="none"></audio>
-            </div>
-        `;
-
-        document.body.appendChild(widget);
-        bindWidgetEvents();
-        syncWithBackend();
-        setInterval(syncWithBackend, 4000);
-    }
-
-    async function syncWithBackend() {
-        const badge = document.getElementById("studio-tts-badge");
-        const modelSel = document.getElementById("studio-tts-model");
-        const refSel = document.getElementById("studio-tts-ref");
-        try {
-            const [st, mdata, rdata] = await Promise.all([
-                apiJsonRequest("/status"),
-                apiJsonRequest("/models"),
-                apiJsonRequest("/reference_files")
-            ]);
-            if (st && badge) {
-                const dev = String(st.device || "online");
-                badge.textContent = dev.includes("cuda") ? "⚡ GPU" : "Online • CPU";
-                badge.style.background = dev.includes("cuda") ? "#065f46" : "#1f2937";
-                badge.style.color = "#34d399";
-                badge.style.borderColor = "#059669";
-            }
-            if (mdata && modelSel) {
-                const list = mdata.models || [];
-                if (list.length > 0) {
-                    const prevVal = modelSel.value;
-                    modelSel.innerHTML = "";
-                    state.modelsMeta = {};
-                    for (const m of list) {
-                        state.modelsMeta[m.id] = m;
-                        const opt = document.createElement("option");
-                        opt.value = m.id;
-                        opt.textContent = m.name;
-                        modelSel.appendChild(opt);
-                    }
-                    if (prevVal && state.modelsMeta[prevVal]) {
-                        modelSel.value = prevVal;
-                    } else if (mdata.loaded_model_id && state.modelsMeta[mdata.loaded_model_id]) {
-                        state.modelId = mdata.loaded_model_id;
-                        modelSel.value = mdata.loaded_model_id;
-                    }
-                }
-            }
-            if (rdata && refSel) {
-                const files = rdata.files || [];
-                if (files.length > 0) {
-                    const prevRef = refSel.value;
-                    refSel.innerHTML = "";
-                    for (const f of files) {
-                        const opt = document.createElement("option");
-                        opt.value = f.name;
-                        opt.textContent = `${f.name} (${f.duration}s)`;
-                        refSel.appendChild(opt);
-                    }
-                    if (prevRef) refSel.value = prevRef;
-                }
-            }
-        } catch (_e) {
-            if (badge) {
-                badge.textContent = "Offline";
-                badge.style.background = "#7f1d1d";
-                badge.style.color = "#fecaca";
-                badge.style.borderColor = "#b91c1c";
-            }
-        }
-    }
-
-    let playChunkAtIndexFn = null;
-    let startOrResumePlaybackFn = null;
-    let stopPlaybackFn = null;
-
-    function bindWidgetEvents() {
-        const bodyEl = document.getElementById("studio-tts-body");
-        const minBtn = document.getElementById("studio-tts-min-btn");
-        const cfgBtn = document.getElementById("studio-tts-cfg-btn");
-        const pickBtn = document.getElementById("studio-tts-pick-btn");
-        const advPanel = document.getElementById("studio-tts-adv-panel");
-        const cssInput = document.getElementById("studio-tts-css-input");
-        const sourceSel = document.getElementById("studio-tts-source");
-        const modeSel = document.getElementById("studio-tts-mode");
-        const modelSel = document.getElementById("studio-tts-model");
-        const refSel = document.getElementById("studio-tts-ref");
-        const spkSel = document.getElementById("studio-tts-speaker");
-        const speedInput = document.getElementById("studio-tts-speed");
-        const speedVal = document.getElementById("studio-tts-speed-val");
-        const stepsInput = document.getElementById("studio-tts-steps");
-        const stepsVal = document.getElementById("studio-tts-steps-val");
-        const promptInput = document.getElementById("studio-tts-prompt");
-        const autoAdvChk = document.getElementById("studio-tts-autoadv");
-        const scanBtn = document.getElementById("studio-tts-scan-btn");
-
-        const playBtn = document.getElementById("local-tts-play-btn");
-        const prevBtn = document.getElementById("studio-tts-prev-btn");
-        const nextBtn = document.getElementById("studio-tts-next-btn");
-        const stopBtn = document.getElementById("studio-tts-stop-btn");
-        const previewEl = document.getElementById("studio-tts-preview");
-        const audioEl = document.getElementById("studio-tts-audio");
-
-        minBtn.addEventListener("click", () => {
-            state.minimized = !state.minimized;
-            bodyEl.style.display = state.minimized ? "none" : "block";
-            minBtn.textContent = state.minimized ? "➕" : "➖";
-        });
-
-        cfgBtn.addEventListener("click", () => {
-            const open = advPanel.style.display !== "none";
-            advPanel.style.display = open ? "none" : "block";
-        });
-
-        cssInput.addEventListener("change", () => {
-            state.cssSelector = cssInput.value.trim();
-            state.selectorDescription = state.cssSelector || "Auto-detección de capítulo";
-            state.chunks = extractChapterChunks(state.chunkSize);
-            state.prefetchCache.clear();
-            setStatusText(`✅ Selector '${state.selectorDescription}': ${state.chunks.length} bloques listos`);
-        });
-
-        sourceSel.addEventListener("change", () => {
-            state.sourceMode = sourceSel.value;
-            state.chunks = [];
-            state.prefetchCache.clear();
-        });
-
-        // Control total del usuario: al cambiar modelo, adaptar por defecto pero permitir reactivar
-        modelSel.addEventListener("change", () => {
-            state.modelId = modelSel.value;
-            const meta = state.modelsMeta[state.modelId] || {};
-            const caps = meta.capabilities || {};
-            const supportsClone = caps.supports_clone !== undefined ? caps.supports_clone : state.modelId.includes("omnivoice");
-            if (!supportsClone && (state.ttsMode === "clone" || state.ttsMode === "design")) {
-                state.ttsMode = "tts";
-                modeSel.value = "tts";
-                setStatusText(`🔔 Incompatibilidad en '${meta.name || state.modelId}': se pasó a Voz Nativa por defecto (puedes reactivar Clonación manualmente).`);
-            }
-            state.prefetchCache.clear();
-        });
-
-        modeSel.addEventListener("change", () => {
-            state.ttsMode = modeSel.value;
-            const meta = state.modelsMeta[state.modelId] || {};
-            const caps = meta.capabilities || {};
-            const supportsClone = caps.supports_clone !== undefined ? caps.supports_clone : state.modelId.includes("omnivoice");
-            if (!supportsClone && (state.ttsMode === "clone" || state.ttsMode === "design")) {
-                setStatusText(`⚠️ Modo ${state.ttsMode.toUpperCase()} forzado por usuario sobre modelo GGUF. Se respetará tu configuración.`);
-            }
-            state.prefetchCache.clear();
-        });
-
-        refSel.addEventListener("change", () => {
-            state.referenceFile = refSel.value;
-            state.prefetchCache.clear();
-        });
-
-        spkSel.addEventListener("change", () => {
-            state.speakerHint = spkSel.value;
-            state.prefetchCache.clear();
-        });
-
-        speedInput.addEventListener("input", () => {
-            state.speed = parseFloat(speedInput.value) || 1.0;
-            speedVal.textContent = `${state.speed.toFixed(2)}x`;
-            state.prefetchCache.clear();
-        });
-
-        stepsInput.addEventListener("input", () => {
-            state.numStep = parseInt(stepsInput.value, 10) || 12;
-            stepsVal.textContent = String(state.numStep);
-            state.prefetchCache.clear();
-        });
-
-        promptInput.addEventListener("change", () => {
-            state.voiceDescription = promptInput.value.trim();
-            state.styleInstruct = promptInput.value.trim();
-            state.prefetchCache.clear();
-        });
-
-        autoAdvChk.addEventListener("change", () => {
-            state.autoAdvance = autoAdvChk.checked;
-        });
-
-        scanBtn.addEventListener("click", () => {
-            state.chunks = extractChapterChunks(state.chunkSize);
-            state.currentIndex = 0;
-            state.prefetchCache.clear();
-            setStatusText(`✅ Escaneados ${state.chunks.length} fragmentos narrativos limpios.`);
-            if (state.chunks.length > 0) {
-                previewEl.textContent = `[1/${state.chunks.length}] ${state.chunks[0].text.slice(0, 110)}...`;
-            }
-        });
-
-        pickBtn.addEventListener("click", () => {
-            if (state.pickingElement) {
-                stopDomInspector();
-                setStatusText("Modo Inspector DOM cancelado.");
-            } else {
-                startDomInspector();
-            }
-        });
-
-        async function playChunkAtIndex(idx) {
-            if (state.stopRequested || idx < 0 || idx >= state.chunks.length) {
-                finishPlayback();
-                return;
-            }
-
-            state.currentIndex = idx;
-            const currentChunk = state.chunks[idx];
-            highlightActiveElement(currentChunk.element);
-            previewEl.textContent = `[${idx + 1}/${state.chunks.length}] ${currentChunk.text}`;
-
-            playBtn.textContent = `⏳ Generando (${idx + 1}/${state.chunks.length})...`;
-            setStatusText(`Sintetizando fragmento ${idx + 1} de ${state.chunks.length}...`);
-
-            if (state.statusPollTimer) clearInterval(state.statusPollTimer);
-            state.statusPollTimer = setInterval(async () => {
-                try {
-                    const st = await apiJsonRequest("/status");
-                    if (st && st.status === "GENERATING" && st.message) {
-                        setStatusText(st.message);
-                    }
-                } catch (_e) {}
-            }, 900);
-
-            try {
-                const wavBlob = await requestChunkAudioBlob(idx);
-                if (state.stopRequested) return;
-
-                if (state.autoAdvance && idx + 1 < state.chunks.length) {
-                    requestChunkAudioBlob(idx + 1).catch(() => {});
-                }
-
-                revokeActiveBlob();
-                const blobUrl = URL.createObjectURL(wavBlob);
-                state.activeBlobUrl = blobUrl;
-
-                audioEl.volume = Math.max(0, Math.min(1, Number(state.volume ?? 1.0)));
-                audioEl.src = blobUrl;
-                audioEl.style.display = "block";
-                audioEl.onended = () => {
-                    revokeActiveBlob();
-                    if (!state.stopRequested && state.autoAdvance && state.currentIndex + 1 < state.chunks.length) {
-                        playChunkAtIndex(state.currentIndex + 1);
-                    } else {
-                        finishPlayback();
-                    }
-                };
-
-                state.isPlaying = true;
-                state.isPaused = false;
-                playBtn.textContent = "⏸ Pausar";
-                setStatusText(`🔊 Narrando párrafo ${idx + 1} de ${state.chunks.length}`);
-                await audioEl.play();
-            } catch (err) {
-                console.error("[Studio TTS LatAm Extension]", err);
-                setStatusText(`❌ ${err.message || "Backend offline en 127.0.0.1:8000"}`);
-                state.isPlaying = false;
-                playBtn.textContent = "▶ Reintentar";
-            } finally {
-                if (state.statusPollTimer) {
-                    clearInterval(state.statusPollTimer);
-                    state.statusPollTimer = null;
-                }
-            }
-        }
-
-        function finishPlayback() {
-            state.isPlaying = false;
-            state.isPaused = false;
-            clearHighlight();
-            playBtn.textContent = "▶ Narrar Capítulo";
-            setStatusText("✅ Lectura finalizada");
-        }
-
-        function startOrResumePlayback(forceRestart = false) {
-            if (!forceRestart && state.isPlaying && !state.isPaused && !audioEl.paused) {
-                audioEl.pause();
-                state.isPaused = true;
-                playBtn.textContent = "⏸ Pausado • ▶ Continuar";
-                setStatusText(`⏸ Pausado en [${state.currentIndex + 1}/${state.chunks.length}]`);
-                return;
-            }
-
-            if (!forceRestart && state.isPlaying && state.isPaused) {
-                state.isPaused = false;
-                playBtn.textContent = "⏸ Pausar";
-                setStatusText(`🔊 Narrando [${state.currentIndex + 1}/${state.chunks.length}]`);
-                audioEl.play();
-                return;
-            }
-
-            state.stopRequested = false;
-            if (state.chunks.length === 0 || forceRestart) {
-                state.chunks = extractChapterChunks(state.chunkSize);
-                if (!forceRestart) state.currentIndex = 0;
-            }
-
-            if (state.chunks.length === 0) {
-                setStatusText("⚠️ No se detectó texto narrativo en esta página.");
-                return;
-            }
-
-            playChunkAtIndex(state.currentIndex);
-        }
-
-        function stopPlayback() {
-            state.stopRequested = true;
-            state.isPlaying = false;
-            state.isPaused = false;
-            if (state.statusPollTimer) {
-                clearInterval(state.statusPollTimer);
-                state.statusPollTimer = null;
-            }
-            try {
-                audioEl.pause();
-                audioEl.currentTime = 0;
-            } catch (_e) {}
-            revokeActiveBlob();
-            clearHighlight();
-            playBtn.textContent = "▶ Narrar Capítulo";
-            setStatusText("⏹ Lectura detenida");
-        }
-
-        playChunkAtIndexFn = playChunkAtIndex;
-        startOrResumePlaybackFn = startOrResumePlayback;
-        stopPlaybackFn = stopPlayback;
-
-        playBtn.addEventListener("click", () => startOrResumePlayback(false));
-
-        prevBtn.addEventListener("click", () => {
-            if (state.chunks.length === 0) {
-                state.chunks = extractChapterChunks(state.chunkSize);
-            }
-            if (state.chunks.length === 0) return;
-            state.stopRequested = false;
-            const prevIdx = Math.max(0, state.currentIndex - 1);
-            playChunkAtIndex(prevIdx);
-        });
-
-        nextBtn.addEventListener("click", () => {
-            if (state.chunks.length === 0) {
-                state.chunks = extractChapterChunks(state.chunkSize);
-            }
-            if (state.chunks.length === 0) return;
-            state.stopRequested = false;
-            const nextIdx = Math.min(state.chunks.length - 1, state.currentIndex + 1);
-            playChunkAtIndex(nextIdx);
-        });
-
-        stopBtn.addEventListener("click", stopPlayback);
-    }
-
-    // =========================================================================
-    // MENSAJERÍA CON EL POPUP DE CONTROL DE LA EXTENSIÓN (popup.js)
+    // SINCRONIZACIÓN CON EL POPUP DE LA EXTENSIÓN (popup.js)
     // =========================================================================
     function applyConfigFromPopup(cfg) {
         if (!cfg) return;
         const wasEnabled = state.enabled;
         state.enabled = Boolean(cfg.enabled);
-        state.showWidget = Boolean(cfg.showWidget);
-        if (typeof cfg.cssSelector === "string") {
-            state.cssSelector = cfg.cssSelector;
-            state.selectorDescription = cfg.cssSelector || "Auto-detección de capítulo";
-            const cssInput = document.getElementById("studio-tts-css-input");
-            if (cssInput) cssInput.value = cfg.cssSelector;
-        }
+
         if (typeof cfg.volume === "number") {
-            state.volume = cfg.volume;
-            const audioEl = document.getElementById("studio-tts-audio");
-            if (audioEl) audioEl.volume = Math.max(0, Math.min(1, cfg.volume));
+            state.volume = Math.max(0, Math.min(1, cfg.volume));
+            audioEl.volume = state.volume;
         }
+
+        // Velocidad modifica en tiempo real el audio actual que se está reproduciendo (sin invalidar caché ni regenerar)
         if (typeof cfg.speed === "number") {
-            state.speed = cfg.speed;
+            state.playbackRate = Math.max(0.4, Math.min(3.0, cfg.speed));
+            audioEl.playbackRate = state.playbackRate;
+            if (state.isPlaying && !state.isPaused) {
+                const nextStatus = state.prefetchStatuses.get(state.currentIndex + 1);
+                const prefetchTag = (state.currentIndex + 1 < state.chunks.length)
+                    ? (nextStatus === "ready" ? " • ⚡ Siguiente listo" : " • 🔄 Pre-generando sig.")
+                    : "";
+                state.statusText = `🔊 Narrando [${state.currentIndex + 1}/${state.chunks.length}] (${state.playbackRate.toFixed(2)}x)${prefetchTag}`;
+            }
         }
+
+        // Solo invalidamos caché de pre-generación si cambió el modelo, modo o voz
+        const synthChanged =
+            (cfg.modelId && cfg.modelId !== state.modelId) ||
+            (cfg.ttsMode && cfg.ttsMode !== state.ttsMode) ||
+            (cfg.referenceFile && cfg.referenceFile !== state.referenceFile) ||
+            (cfg.speakerHint && cfg.speakerHint !== state.speakerHint);
+
         if (cfg.modelId) state.modelId = cfg.modelId;
         if (cfg.ttsMode) state.ttsMode = cfg.ttsMode;
         if (cfg.referenceFile) state.referenceFile = cfg.referenceFile;
         if (cfg.speakerHint) state.speakerHint = cfg.speakerHint;
         if (typeof cfg.autoAdvance === "boolean") state.autoAdvance = cfg.autoAdvance;
 
-        state.prefetchCache.clear();
-        updateWidgetVisibility();
+        if (typeof cfg.cssSelector === "string" && cfg.cssSelector !== state.cssSelector) {
+            state.cssSelector = cfg.cssSelector;
+            state.selectorDescription = cfg.cssSelector || "Auto-detección de capítulo";
+            state.chunks = extractChapterChunks(state.chunkSize);
+            invalidatePrefetchCache();
+        } else if (synthChanged) {
+            invalidatePrefetchCache();
+            if (state.isPlaying) {
+                triggerActivePrefetch(state.currentIndex);
+            }
+        }
 
-        if (wasEnabled && !state.enabled && stopPlaybackFn) {
-            stopPlaybackFn();
+        if (wasEnabled && !state.enabled) {
+            stopPlayback();
         }
     }
 
@@ -1085,12 +733,14 @@
         chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             if (!msg || !msg.type) return false;
 
-            ensureWidgetExists();
-
             if (msg.type === "STUDIO_TTS_GET_STATE") {
                 if (state.chunks.length === 0) {
                     state.chunks = extractChapterChunks(state.chunkSize);
                 }
+                const nextIdx = state.currentIndex + 1;
+                const nextPrefetchState = (nextIdx < state.chunks.length)
+                    ? (state.prefetchStatuses.get(nextIdx) || "idle")
+                    : "none";
                 sendResponse({
                     enabled: state.enabled,
                     isPlaying: state.isPlaying,
@@ -1099,7 +749,8 @@
                     currentIndex: state.currentIndex,
                     cssSelector: state.cssSelector,
                     selectorDescription: state.selectorDescription,
-                    statusText: state.statusText
+                    statusText: state.statusText,
+                    nextPrefetchState
                 });
                 return true;
             }
@@ -1112,8 +763,6 @@
 
             if (msg.type === "STUDIO_TTS_START_INSPECTOR") {
                 state.enabled = true;
-                state.showWidget = true;
-                updateWidgetVisibility();
                 startDomInspector();
                 sendResponse({ ok: true });
                 return true;
@@ -1125,25 +774,26 @@
                 state.customContainer = null;
                 state.chunks = extractChapterChunks(state.chunkSize);
                 state.currentIndex = 0;
-                state.prefetchCache.clear();
-                setStatusText(`🎯 Selector '${state.selectorDescription}': ${state.chunks.length} bloques listos`);
+                invalidatePrefetchCache();
+                state.statusText = `🎯 Selector '${state.selectorDescription}': ${state.chunks.length} bloques listos`;
                 sendResponse({ ok: state.chunks.length > 0, chunksCount: state.chunks.length });
                 return true;
             }
 
             if (msg.type === "STUDIO_TTS_COMMAND") {
                 state.enabled = true;
-                updateWidgetVisibility();
-                if (msg.action === "play_pause" && startOrResumePlaybackFn) {
-                    startOrResumePlaybackFn(false);
-                } else if (msg.action === "prev" && playChunkAtIndexFn) {
+                if (msg.action === "play_pause") {
+                    startOrResumePlayback(false);
+                } else if (msg.action === "prev") {
                     if (state.chunks.length === 0) state.chunks = extractChapterChunks(state.chunkSize);
-                    playChunkAtIndexFn(Math.max(0, state.currentIndex - 1));
-                } else if (msg.action === "next" && playChunkAtIndexFn) {
+                    state.stopRequested = false;
+                    playChunkAtIndex(Math.max(0, state.currentIndex - 1));
+                } else if (msg.action === "next") {
                     if (state.chunks.length === 0) state.chunks = extractChapterChunks(state.chunkSize);
-                    playChunkAtIndexFn(Math.min(state.chunks.length - 1, state.currentIndex + 1));
-                } else if (msg.action === "stop" && stopPlaybackFn) {
-                    stopPlaybackFn();
+                    state.stopRequested = false;
+                    playChunkAtIndex(Math.min(state.chunks.length - 1, state.currentIndex + 1));
+                } else if (msg.action === "stop") {
+                    stopPlayback();
                 }
                 sendResponse({ ok: true });
                 return true;
@@ -1153,20 +803,11 @@
         });
     }
 
-    function initFromStorage() {
-        createFloatingWidget();
-        if (typeof chrome !== "undefined" && chrome.storage && chrome.storage.local) {
-            chrome.storage.local.get(["studioTtsConfig"], (res) => {
-                if (res && res.studioTtsConfig) {
-                    applyConfigFromPopup(res.studioTtsConfig);
-                }
-            });
-        }
-    }
-
-    if (document.readyState === "loading") {
-        document.addEventListener("DOMContentLoaded", initFromStorage);
-    } else {
-        initFromStorage();
+    if (typeof chrome !== "undefined" && chrome.storage && chrome.storage.local) {
+        chrome.storage.local.get(["studioTtsConfig"], (res) => {
+            if (res && res.studioTtsConfig) {
+                applyConfigFromPopup(res.studioTtsConfig);
+            }
+        });
     }
 })();

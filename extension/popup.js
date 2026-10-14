@@ -1,9 +1,9 @@
 /**
- * Popup Controller de Studio TTS LatAm v3.1
- * - Muestra en vivo el estado de conexión con el Backend (127.0.0.1:8000).
- * - Controla la activación de la extensión y reproducción (desactivadas por defecto).
- * - Activa el Inspector DOM tipo Brave DevTools (Ctrl+Shift+X) o aplica un selector CSS/grupo de etiquetas.
- * - Muestra notificaciones transitorias de compatibilidad de modelos desactivando por defecto opciones incompatibles pero permitiendo que el usuario las reactive libremente.
+ * Popup Controller de Studio TTS LatAm v3.3
+ * - Control exclusivo desde el menú desplegable de la extensión (sin barra flotante en la página).
+ * - Velocidad de reproducción en vivo (modifica instantáneamente audioEl.playbackRate del audio actual).
+ * - Estado de pre-generación activa de los siguientes párrafos.
+ * - Notificaciones transitorias de compatibilidad de modelos con control total del usuario.
  */
 
 (function () {
@@ -42,7 +42,6 @@
   const selRef = document.getElementById("sel-ref");
   const selSpeaker = document.getElementById("sel-speaker");
   const chkAutoAdv = document.getElementById("chk-autoadv");
-  const chkShowWidget = document.getElementById("chk-show-widget");
   const btnRefreshBackend = document.getElementById("btn-refresh-backend");
 
   let modelsMeta = {};
@@ -80,7 +79,6 @@
   function saveSettingsToStorage() {
     const cfg = {
       enabled: swEnableExt.checked,
-      showWidget: chkShowWidget.checked,
       cssSelector: inpCssSelector.value.trim(),
       volume: Number(rngVol.value) / 100,
       speed: Number(rngSpeed.value),
@@ -98,8 +96,7 @@
     return new Promise((resolve) => {
       chrome.storage.local.get(["studioTtsConfig"], (res) => {
         const cfg = res.studioTtsConfig || {
-          enabled: false, // Reproducción y extensión desactivadas por defecto
-          showWidget: false,
+          enabled: false,
           cssSelector: "",
           volume: 1.0,
           speed: 1.0,
@@ -110,7 +107,6 @@
           autoAdvance: true
         };
         swEnableExt.checked = Boolean(cfg.enabled);
-        chkShowWidget.checked = Boolean(cfg.showWidget);
         inpCssSelector.value = cfg.cssSelector || "";
         const volPct = Math.round((cfg.volume ?? 1.0) * 100);
         rngVol.value = String(volPct);
@@ -140,9 +136,9 @@
   async function syncBackendStatus() {
     try {
       const [stRes, modRes, refRes] = await Promise.all([
-        fetch(`${API_BASE}/status`),
-        fetch(`${API_BASE}/models`),
-        fetch(`${API_BASE}/reference_files`)
+        fetch(`${API_BASE}/status`, { cache: "no-store" }),
+        fetch(`${API_BASE}/models`, { cache: "no-store" }),
+        fetch(`${API_BASE}/reference_files`, { cache: "no-store" })
       ]);
 
       if (stRes.ok) {
@@ -232,13 +228,9 @@
   // Eventos de UI
   swEnableExt.addEventListener("change", () => {
     updateToggleLabels();
-    if (swEnableExt.checked) {
-      chkShowWidget.checked = true;
-    }
     saveSettingsToStorage();
   });
 
-  chkShowWidget.addEventListener("change", saveSettingsToStorage);
   chkAutoAdv.addEventListener("change", saveSettingsToStorage);
   selRef.addEventListener("change", saveSettingsToStorage);
   selSpeaker.addEventListener("change", saveSettingsToStorage);
@@ -298,7 +290,6 @@
   btnInspectDom.addEventListener("click", async () => {
     if (!swEnableExt.checked) {
       swEnableExt.checked = true;
-      chkShowWidget.checked = true;
       updateToggleLabels();
       saveSettingsToStorage();
     }
@@ -310,7 +301,6 @@
     const sel = inpCssSelector.value.trim();
     if (!swEnableExt.checked) {
       swEnableExt.checked = true;
-      chkShowWidget.checked = true;
       updateToggleLabels();
     }
     saveSettingsToStorage();
@@ -326,27 +316,26 @@
   btnPlayPause.addEventListener("click", async () => {
     if (!swEnableExt.checked) {
       swEnableExt.checked = true;
-      chkShowWidget.checked = true;
       updateToggleLabels();
       saveSettingsToStorage();
     }
     await sendToActiveTab({ type: "STUDIO_TTS_COMMAND", action: "play_pause" });
-    setTimeout(refreshTabPlaybackState, 250);
+    setTimeout(refreshTabPlaybackState, 200);
   });
 
   btnPrev.addEventListener("click", async () => {
     await sendToActiveTab({ type: "STUDIO_TTS_COMMAND", action: "prev" });
-    setTimeout(refreshTabPlaybackState, 250);
+    setTimeout(refreshTabPlaybackState, 200);
   });
 
   btnNext.addEventListener("click", async () => {
     await sendToActiveTab({ type: "STUDIO_TTS_COMMAND", action: "next" });
-    setTimeout(refreshTabPlaybackState, 250);
+    setTimeout(refreshTabPlaybackState, 200);
   });
 
   btnStop.addEventListener("click", async () => {
     await sendToActiveTab({ type: "STUDIO_TTS_COMMAND", action: "stop" });
-    setTimeout(refreshTabPlaybackState, 250);
+    setTimeout(refreshTabPlaybackState, 200);
   });
 
   btnRefreshBackend.addEventListener("click", () => {
@@ -354,12 +343,11 @@
     refreshTabPlaybackState();
   });
 
-  // Inicialización
   (async () => {
     await loadSettingsFromStorage();
     await syncBackendStatus();
     await refreshTabPlaybackState();
     setInterval(syncBackendStatus, 2500);
-    setInterval(refreshTabPlaybackState, 1200);
+    setInterval(refreshTabPlaybackState, 900);
   })();
 })();
