@@ -1,13 +1,18 @@
 {
   "manifest_version": 3,
-  "name": "Brave TTS Reader (LatAm)",
-  "version": "1.0",
-  "description": "Lector de novelas WTR-Lab con motor local TTS Zero-Shot.",
+  "name": "Studio TTS LatAm Reader (Zero-Shot & Local TTS)",
+  "version": "2.0.0",
+  "description": "Lector flotante para WTR-Lab y páginas web conectado al motor local Studio TTS LatAm (OmniVoice Zero-Shot / Orpheus GGUF).",
   "permissions": ["activeTab", "scripting"],
-  "host_permissions": ["https://wtr-lab.com/*", "http://localhost:8000/*"],
+  "host_permissions": [
+    "https://wtr-lab.com/*",
+    "https://*.wtr-lab.com/*",
+    "http://localhost:8000/*",
+    "http://127.0.0.1:8000/*"
+  ],
   "content_scripts": [
     {
-      "matches": ["https://wtr-lab.com/*/novel/*/chapter-*"],
+      "matches": ["https://wtr-lab.com/*", "https://*.wtr-lab.com/*"],
       "js": ["content.js"],
       "css": ["style.css"]
     }
