@@ -1,3 +1,8 @@
 .venv/
 backend/venv/
 frontend/venv/
+backend.log
+test.log
+backend/models/
+backend/reference_preview.wav
+test_deps.py
