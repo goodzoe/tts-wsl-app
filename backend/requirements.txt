@@ -4,9 +4,14 @@ python-multipart
 pydantic
 requests
 huggingface-hub
-# llama-cpp-python se debe compilar con soporte CUDA en Windows/WSL
-# pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
-llama-cpp-python
+tqdm
+numpy
 soundfile
+torch
 torchaudio
-encodec
+snac
+llama-cpp-python
+omnivoice
+accelerate
+librosa
+pydub

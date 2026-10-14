@@ -852,7 +852,39 @@ def _generate_with_omnivoice(request: TTSRequest, ref_path: str) -> None:
         f"🧠 OmniVoice generando [modo={request.mode}, pasos={gen_config.num_step}, ref={os.path.basename(ref_path)}]...",
         flush=True,
     )
-    audio_list = omni_model.generate(**kw)
+    step_counter = [0]
+    total_steps = max(1, int(gen_config.num_step))
+    step_start_t = time.time()
+
+    def _omni_step_hook(_mod, _inp, _out):
+        step_counter[0] += 1
+        cur_step = min(total_steps, step_counter[0])
+        pct = min(96.0, 15.0 + (cur_step / total_steps) * 80.0)
+        elapsed = max(0.1, time.time() - step_start_t)
+        avg_per_step = elapsed / cur_step
+        rem_s = max(0, int((total_steps - cur_step) * avg_per_step))
+        tot_est_s = max(int(elapsed), int(elapsed) + rem_s)
+        backend_state["download_progress"] = round(pct, 1)
+        backend_state["task_elapsed_sec"] = int(elapsed)
+        backend_state["task_eta_sec"] = rem_s
+        backend_state["message"] = (
+            f"OmniVoice ({request.mode.upper()}): paso {cur_step}/{total_steps} ({pct:.0f}%) • ETA {int(elapsed)}s / ~{tot_est_s}s"
+        )
+
+    hook_handle = None
+    try:
+        hook_handle = omni_model.register_forward_hook(_omni_step_hook)
+    except Exception:
+        hook_handle = None
+
+    try:
+        audio_list = omni_model.generate(**kw)
+    finally:
+        if hook_handle is not None:
+            try:
+                hook_handle.remove()
+            except Exception:
+                pass
     wav_out = np.asarray(audio_list[0], dtype=np.float32)
 
     if abs(float(request.pitch_semitones)) > 0.05:
@@ -952,11 +984,12 @@ def generate_tts(request: TTSRequest):
                             elapsed = max(0.2, time.time() - gen_start)
                             rate = n_gen / elapsed
                             rem_s = max(1, int(max(0, max_tokens_limit - n_gen) / max(1.0, rate)))
+                            tot_est_s = int(elapsed) + rem_s
                             backend_state["download_progress"] = round(pct, 1)
                             backend_state["task_elapsed_sec"] = int(elapsed)
                             backend_state["task_eta_sec"] = rem_s
                             backend_state["message"] = (
-                                f"Generando voz: {pct:.0f}% ({n_gen // 7} frames) • {int(elapsed)}s • ETA: ~{rem_s}s"
+                                f"Generando voz: {pct:.0f}% ({n_gen // 7} frames) • ETA {int(elapsed)}s / ~{tot_est_s}s"
                             )
                     if len(generated_tokens) >= max_tokens_limit:
                         break
