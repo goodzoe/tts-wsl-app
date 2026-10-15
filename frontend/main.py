@@ -31,12 +31,213 @@ ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
 
+class ResponsiveModeSelector(ctk.CTkFrame):
+    """
+    Selector de modos responsive tipo CSS Flexbox (display: flex; flex-wrap: wrap; flex: 1 1 0%).
+    Reemplaza a CTkSegmentedButton manteniendo exactamente la misma API (.get(), .set(), values, command, variable)
+    pero permitiendo que los 3 botones de modo se expandan, ajusten su texto o salten de línea cuando el ancho es reducido:
+      - Ancho >= 660px: 1 fila con 3 columnas iguales (flex: 1 1 33.3%).
+      - Ancho entre 430px y 659px: 2 botones arriba (50% / 50%) + 3er botón abajo al 100% (flex-wrap).
+      - Ancho < 430px: 3 botones apilados verticalmente al 100% de ancho (flex-direction: column).
+    """
+
+    def __init__(
+        self,
+        master,
+        values=None,
+        command=None,
+        variable=None,
+        selected_color="#2563eb",
+        selected_hover_color="#1d4ed8",
+        unselected_color="#1f2937",
+        unselected_hover_color="#374151",
+        text_color="#f9fafb",
+        font=("Helvetica", 12, "bold"),
+        height=34,
+        corner_radius=8,
+        **kwargs,
+    ):
+        super().__init__(master, fg_color="#111827", corner_radius=corner_radius + 2, **kwargs)
+        self._values = list(values or [])
+        self._command = command
+        self._variable = variable
+        self._selected_color = selected_color
+        self._selected_hover_color = selected_hover_color
+        self._unselected_color = unselected_color
+        self._unselected_hover_color = unselected_hover_color
+        self._text_color = text_color
+        self._font = font
+        self._btn_height = height
+        self._corner_radius = corner_radius
+        self._buttons: dict[str, ctk.CTkButton] = {}
+        self._layout_mode = None
+        self._last_w = 0
+
+        self._current_value = (
+            self._variable.get()
+            if self._variable is not None and self._variable.get() in self._values
+            else (self._values[0] if self._values else "")
+        )
+
+        self._build_buttons()
+        if self._variable is not None:
+            self._variable.trace_add("write", self._on_var_trace)
+
+        self.bind("<Configure>", self._on_resize, add="+")
+
+    def _build_buttons(self) -> None:
+        for btn in self._buttons.values():
+            btn.destroy()
+        self._buttons.clear()
+
+        for val in self._values:
+            btn = ctk.CTkButton(
+                self,
+                text=val,
+                width=10,
+                height=self._btn_height,
+                corner_radius=self._corner_radius,
+                font=self._font,
+                text_color=self._text_color,
+                command=lambda v=val: self._on_click(v),
+            )
+            try:
+                if hasattr(btn, "_text_label") and btn._text_label is not None:
+                    btn._text_label.configure(justify="center")
+            except Exception:
+                pass
+            self._buttons[val] = btn
+
+        self._update_button_styles()
+        self._layout_mode = None
+        self._apply_flex_layout(self.winfo_width() or 760)
+
+    def _on_click(self, value: str) -> None:
+        self.set(value)
+        if callable(self._command):
+            self._command(value)
+
+    def _on_var_trace(self, *_args) -> None:
+        if self._variable is not None:
+            val = self._variable.get()
+            if val != self._current_value and val in self._values:
+                self._current_value = val
+                self._update_button_styles()
+
+    def _update_button_styles(self) -> None:
+        for val, btn in self._buttons.items():
+            is_sel = val == self._current_value
+            btn.configure(
+                fg_color=self._selected_color if is_sel else self._unselected_color,
+                hover_color=self._selected_hover_color if is_sel else self._unselected_hover_color,
+            )
+
+    def _on_resize(self, event) -> None:
+        if event.widget is not self:
+            return
+        w = max(1, int(event.width))
+        if abs(w - self._last_w) < 6:
+            return
+        self._last_w = w
+        self._apply_flex_layout(w)
+
+    def _apply_flex_layout(self, width: int) -> None:
+        n = len(self._values)
+        if n == 0:
+            return
+
+        if width >= 660:
+            new_mode = "row_3col"
+        elif width >= 430 and n == 3:
+            new_mode = "wrap_2plus1"
+        else:
+            new_mode = "column_stack"
+
+        btn_list = [self._buttons[v] for v in self._values]
+
+        if self._layout_mode != new_mode:
+            for b in btn_list:
+                b.grid_forget()
+            for col_idx in range(max(3, n)):
+                self.grid_columnconfigure(col_idx, weight=0, uniform="")
+
+            if new_mode == "row_3col":
+                for idx, b in enumerate(btn_list):
+                    self.grid_columnconfigure(idx, weight=1, uniform="mode_flex_3")
+                    b.grid(row=0, column=idx, padx=3, pady=3, sticky="ew")
+            elif new_mode == "wrap_2plus1":
+                self.grid_columnconfigure(0, weight=1, uniform="mode_flex_2")
+                self.grid_columnconfigure(1, weight=1, uniform="mode_flex_2")
+                btn_list[0].grid(row=0, column=0, padx=3, pady=3, sticky="ew")
+                btn_list[1].grid(row=0, column=1, padx=3, pady=(3, 2), sticky="ew")
+                btn_list[2].grid(row=1, column=0, columnspan=2, padx=3, pady=(2, 3), sticky="ew")
+            else:
+                self.grid_columnconfigure(0, weight=1)
+                for idx, b in enumerate(btn_list):
+                    b.grid(row=idx, column=0, padx=3, pady=2, sticky="ew")
+
+            self._layout_mode = new_mode
+
+        if new_mode == "row_3col":
+            col_w = max(90, (width // n) - 18)
+            for b in btn_list:
+                self._configure_btn_text_fit(b, col_w)
+        elif new_mode == "wrap_2plus1":
+            half_w = max(100, (width // 2) - 18)
+            full_w = max(160, width - 18)
+            self._configure_btn_text_fit(btn_list[0], half_w)
+            self._configure_btn_text_fit(btn_list[1], half_w)
+            self._configure_btn_text_fit(btn_list[2], full_w)
+        else:
+            full_w = max(120, width - 18)
+            for b in btn_list:
+                self._configure_btn_text_fit(b, full_w)
+
+    def _configure_btn_text_fit(self, btn: ctk.CTkButton, avail_px: int) -> None:
+        text_len = len(btn.cget("text") or "")
+        est_px = text_len * 7.2
+        needs_wrap = est_px > avail_px
+        target_h = max(self._btn_height, 44) if needs_wrap else self._btn_height
+        try:
+            if btn.cget("height") != target_h:
+                btn.configure(height=target_h)
+            if hasattr(btn, "_text_label") and btn._text_label is not None:
+                btn._text_label.configure(wraplength=max(80, avail_px))
+        except Exception:
+            pass
+
+    def get(self) -> str:
+        return self._current_value
+
+    def set(self, value: str, from_variable_callback: bool = False) -> None:
+        if value in self._values:
+            self._current_value = value
+            if self._variable is not None and not from_variable_callback:
+                if self._variable.get() != value:
+                    self._variable.set(value)
+            self._update_button_styles()
+
+    def configure(self, require_redraw=False, **kwargs):
+        if "values" in kwargs:
+            self._values = list(kwargs.pop("values"))
+            self._build_buttons()
+        if "command" in kwargs:
+            self._command = kwargs.pop("command")
+        if "variable" in kwargs:
+            self._variable = kwargs.pop("variable")
+        if "state" in kwargs:
+            st = kwargs.pop("state")
+            for btn in self._buttons.values():
+                btn.configure(state=st)
+        super().configure(require_redraw=require_redraw, **kwargs)
+
+
 class TTSApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("Studio TTS LatAm - Clonación Zero-Shot GPU (OmniVoice) & Modelos Locales")
         self.geometry("980x900")
-        self.minsize(760, 680)
+        self.minsize(520, 640)
 
         self.api_url = "http://127.0.0.1:8000"
         self.downloaded_audio = os.path.join(BASE_DIR, "resultado.wav")
@@ -51,6 +252,9 @@ class TTSApp(ctk.CTk):
         self._status_poll_inflight = False
         self._models_synced_once = False
         self._last_wrap_w = 0
+        self._models_row_mode = None
+        self._presets_row_mode = None
+        self._header_row_mode = None
 
         # Protección para que los errores en rojo NUNCA desaparezcan solos antes de ser leídos:
         self._sticky_error_msg = ""
@@ -77,21 +281,23 @@ class TTSApp(ctk.CTk):
         self.frame_top = ctk.CTkFrame(self, fg_color="transparent")
         self.frame_top.pack(side="top", fill="x", pady=(8, 2), padx=18)
 
-        row_title = ctk.CTkFrame(self.frame_top, fg_color="transparent")
-        row_title.pack(fill="x")
+        self.row_title = ctk.CTkFrame(self.frame_top, fg_color="transparent")
+        self.row_title.pack(fill="x")
+        self.row_title.grid_columnconfigure(0, weight=1)
 
         self.lbl_title = ctk.CTkLabel(
-            row_title, text="Studio TTS LatAm ⚡", font=("Helvetica", 22, "bold")
+            self.row_title, text="Studio TTS LatAm ⚡", font=("Helvetica", 22, "bold"), anchor="w"
         )
-        self.lbl_title.pack(side="left")
+        self.lbl_title.grid(row=0, column=0, sticky="w")
 
         self.lbl_ram = ctk.CTkLabel(
-            row_title,
+            self.row_title,
             text="GPU: -- | RAM App: -- MB | Sistema: -- GB",
             font=("Consolas", 11, "bold"),
             text_color="#60a5fa",
+            anchor="e",
         )
-        self.lbl_ram.pack(side="right", pady=(4, 0))
+        self.lbl_ram.grid(row=0, column=1, pady=(4, 0), sticky="e")
 
         self.frame_status_banner = ctk.CTkFrame(
             self.frame_top, corner_radius=8, fg_color="#111827", border_width=1, border_color="#1f2937"
@@ -219,12 +425,12 @@ class TTSApp(ctk.CTk):
         self.frame_models.pack(pady=4, padx=8, fill="x")
         self.frame_models.grid_columnconfigure(0, weight=1)
 
-        frame_models_top = ctk.CTkFrame(self.frame_models, fg_color="transparent")
-        frame_models_top.grid(row=0, column=0, padx=12, pady=(6, 2), sticky="ew")
-        frame_models_top.grid_columnconfigure(0, weight=1)
+        self.frame_models_top = ctk.CTkFrame(self.frame_models, fg_color="transparent")
+        self.frame_models_top.grid(row=0, column=0, padx=12, pady=(6, 2), sticky="ew")
+        self.frame_models_top.grid_columnconfigure(0, weight=1)
 
         self.lbl_models_header = ctk.CTkLabel(
-            frame_models_top,
+            self.frame_models_top,
             text="🧠 Modelo IA Activo y Gestión de Memoria (OmniVoice GPU clona voz / diseña voz / TTS):",
             font=("Helvetica", 12, "bold"),
             anchor="w",
@@ -233,7 +439,7 @@ class TTSApp(ctk.CTk):
         self.lbl_models_header.grid(row=0, column=0, sticky="ew")
 
         self.lbl_loaded_model = ctk.CTkLabel(
-            frame_models_top,
+            self.frame_models_top,
             text="Activo: Verificando...",
             font=("Consolas", 11, "bold"),
             text_color="#34d399",
@@ -242,21 +448,20 @@ class TTSApp(ctk.CTk):
         )
         self.lbl_loaded_model.grid(row=0, column=1, padx=(8, 0), sticky="e")
 
-        frame_models_row = ctk.CTkFrame(self.frame_models, fg_color="transparent")
-        frame_models_row.grid(row=1, column=0, padx=12, pady=(2, 8), sticky="ew")
-        frame_models_row.grid_columnconfigure(0, weight=1)
+        self.frame_models_row = ctk.CTkFrame(self.frame_models, fg_color="transparent")
+        self.frame_models_row.grid(row=1, column=0, padx=12, pady=(2, 8), sticky="ew")
+        self.frame_models_row.grid_columnconfigure(0, weight=1)
 
         self.opt_model = ctk.CTkOptionMenu(
-            frame_models_row,
+            self.frame_models_row,
             values=list(const.MODEL_LABELS_TO_ID.keys()),
             dynamic_resizing=False,
             command=self.on_model_select_change,
         )
         self.opt_model.set("OmniVoice Zero-Shot 0.6B (Clonación Real + Diseño de Voz - 1.5 GB)")
-        self.opt_model.grid(row=0, column=0, padx=(0, 6), pady=2, sticky="ew")
 
         self.btn_load_model = ctk.CTkButton(
-            frame_models_row,
+            self.frame_models_row,
             text="⚡ Cargar Modelo",
             width=126,
             height=30,
@@ -266,10 +471,9 @@ class TTSApp(ctk.CTk):
             font=("Helvetica", 12, "bold"),
             command=self.load_selected_model,
         )
-        self.btn_load_model.grid(row=0, column=1, padx=3, pady=2)
 
         self.btn_add_local_dir = ctk.CTkButton(
-            frame_models_row,
+            self.frame_models_row,
             text="📁 Carpeta Modelo",
             width=126,
             height=30,
@@ -279,10 +483,9 @@ class TTSApp(ctk.CTk):
             font=("Helvetica", 11, "bold"),
             command=self.browse_and_add_local_folder,
         )
-        self.btn_add_local_dir.grid(row=0, column=2, padx=3, pady=2)
 
         self.btn_add_local_file = ctk.CTkButton(
-            frame_models_row,
+            self.frame_models_row,
             text="➕ Archivo .GGUF",
             width=122,
             height=30,
@@ -292,10 +495,9 @@ class TTSApp(ctk.CTk):
             font=("Helvetica", 11, "bold"),
             command=self.browse_and_add_local_gguf,
         )
-        self.btn_add_local_file.grid(row=0, column=3, padx=3, pady=2)
 
         self.btn_unload_model = ctk.CTkButton(
-            frame_models_row,
+            self.frame_models_row,
             text="🧹 Liberar RAM",
             width=116,
             height=30,
@@ -305,32 +507,31 @@ class TTSApp(ctk.CTk):
             font=("Helvetica", 12, "bold"),
             command=self.unload_model_from_ram,
         )
-        self.btn_unload_model.grid(row=0, column=4, padx=(3, 0), pady=2)
 
-        # --- SECCIÓN 1: MODO DE OPERACIÓN + PRESETS + RESTABLECER (GRID RESPONSIVE) ---
-        frame_mode_bar = ctk.CTkFrame(self.main_scroll, fg_color="transparent")
-        frame_mode_bar.pack(fill="x", padx=8, pady=(4, 2))
-        frame_mode_bar.grid_columnconfigure(1, weight=1)
+        self._reflow_models_row(900)
 
-        ctk.CTkLabel(
-            frame_mode_bar,
-            text="Modo:",
+        # --- SECCIÓN 1: MODO DE OPERACIÓN + PRESETS + RESTABLECER (FLEXBOX RESPONSIVE) ---
+        self.frame_mode_bar = ctk.CTkFrame(self.main_scroll, fg_color="transparent")
+        self.frame_mode_bar.pack(fill="x", padx=8, pady=(4, 2))
+        self.frame_mode_bar.grid_columnconfigure(0, weight=1)
+
+        self.frame_mode_top_row = ctk.CTkFrame(self.frame_mode_bar, fg_color="transparent")
+        self.frame_mode_top_row.grid(row=0, column=0, sticky="ew", pady=(0, 3))
+        self.frame_mode_top_row.grid_columnconfigure(0, weight=1)
+
+        self.lbl_mode_title = ctk.CTkLabel(
+            self.frame_mode_top_row,
+            text="🎛️ Modo de Operación:",
             font=("Helvetica", 13, "bold"),
-        ).grid(row=0, column=0, padx=(0, 6), pady=2, sticky="w")
-
-        self.seg_mode = ctk.CTkSegmentedButton(
-            frame_mode_bar,
-            values=list(MODE_UI_TO_API.keys()),
-            font=("Helvetica", 12, "bold"),
-            selected_color="#2563eb",
-            selected_hover_color="#1d4ed8",
-            command=self.on_mode_change,
+            anchor="w",
         )
-        self.seg_mode.set("🎙️ Clonación de Voz (Audio Base)")
-        self.seg_mode.grid(row=0, column=1, padx=(0, 8), pady=2, sticky="w")
+        self.lbl_mode_title.grid(row=0, column=0, padx=(2, 6), pady=2, sticky="w")
+
+        self.frame_preset_btns = ctk.CTkFrame(self.frame_mode_top_row, fg_color="transparent")
+        self.frame_preset_btns.grid(row=0, column=1, sticky="e")
 
         self.btn_save_preset = ctk.CTkButton(
-            frame_mode_bar,
+            self.frame_preset_btns,
             text="💾 Guardar Config",
             width=115,
             height=28,
@@ -340,10 +541,10 @@ class TTSApp(ctk.CTk):
             font=("Helvetica", 11, "bold"),
             command=self.save_preset_dialog,
         )
-        self.btn_save_preset.grid(row=0, column=2, padx=3, pady=2)
+        self.btn_save_preset.grid(row=0, column=0, padx=3, pady=2, sticky="ew")
 
         self.btn_load_preset = ctk.CTkButton(
-            frame_mode_bar,
+            self.frame_preset_btns,
             text="📂 Cargar Config",
             width=112,
             height=28,
@@ -353,10 +554,10 @@ class TTSApp(ctk.CTk):
             font=("Helvetica", 11, "bold"),
             command=self.load_preset_dialog,
         )
-        self.btn_load_preset.grid(row=0, column=3, padx=3, pady=2)
+        self.btn_load_preset.grid(row=0, column=1, padx=3, pady=2, sticky="ew")
 
         self.btn_reset_params = ctk.CTkButton(
-            frame_mode_bar,
+            self.frame_preset_btns,
             text="↺ Restablecer",
             width=110,
             height=28,
@@ -367,7 +568,18 @@ class TTSApp(ctk.CTk):
             font=("Helvetica", 12, "bold"),
             command=self.reset_default_params,
         )
-        self.btn_reset_params.grid(row=0, column=4, padx=(3, 0), pady=2)
+        self.btn_reset_params.grid(row=0, column=2, padx=(3, 0), pady=2, sticky="ew")
+
+        self.seg_mode = ResponsiveModeSelector(
+            self.frame_mode_bar,
+            values=list(MODE_UI_TO_API.keys()),
+            font=("Helvetica", 12, "bold"),
+            selected_color="#2563eb",
+            selected_hover_color="#1d4ed8",
+            command=self.on_mode_change,
+        )
+        self.seg_mode.set("🎙️ Clonación de Voz (Audio Base)")
+        self.seg_mode.grid(row=1, column=0, pady=(2, 2), sticky="ew")
 
         self.lbl_ux_hint = ctk.CTkLabel(
             self.main_scroll,
@@ -402,6 +614,91 @@ class TTSApp(ctk.CTk):
             "1.0",
             "Hola, esta es una prueba de clonación de voz natural y expresiva en español acelerada por GPU.",
         )
+
+    def _reflow_models_row(self, avail_w: int):
+        """Aplica reflujo tipo Flexbox a la barra de modelos para evitar que los botones se oculten en anchos reducidos."""
+        if avail_w >= 760:
+            new_mode = "inline"
+        elif avail_w >= 480:
+            new_mode = "wrap_4col"
+        else:
+            new_mode = "wrap_2x2"
+
+        if self._models_row_mode == new_mode:
+            return
+        self._models_row_mode = new_mode
+
+        for w in (
+            self.opt_model,
+            self.btn_load_model,
+            self.btn_add_local_dir,
+            self.btn_add_local_file,
+            self.btn_unload_model,
+        ):
+            w.grid_forget()
+
+        for c in range(5):
+            self.frame_models_row.grid_columnconfigure(c, weight=0, uniform="")
+
+        if new_mode == "inline":
+            self.frame_models_row.grid_columnconfigure(0, weight=1)
+            self.opt_model.grid(row=0, column=0, padx=(0, 6), pady=2, sticky="ew")
+            self.btn_load_model.grid(row=0, column=1, padx=3, pady=2)
+            self.btn_add_local_dir.grid(row=0, column=2, padx=3, pady=2)
+            self.btn_add_local_file.grid(row=0, column=3, padx=3, pady=2)
+            self.btn_unload_model.grid(row=0, column=4, padx=(3, 0), pady=2)
+        elif new_mode == "wrap_4col":
+            for c in range(4):
+                self.frame_models_row.grid_columnconfigure(c, weight=1, uniform="mdl_btn")
+            self.opt_model.grid(row=0, column=0, columnspan=4, padx=0, pady=(2, 4), sticky="ew")
+            self.btn_load_model.grid(row=1, column=0, padx=2, pady=2, sticky="ew")
+            self.btn_add_local_dir.grid(row=1, column=1, padx=2, pady=2, sticky="ew")
+            self.btn_add_local_file.grid(row=1, column=2, padx=2, pady=2, sticky="ew")
+            self.btn_unload_model.grid(row=1, column=3, padx=2, pady=2, sticky="ew")
+        else:
+            self.frame_models_row.grid_columnconfigure(0, weight=1, uniform="mdl_btn2")
+            self.frame_models_row.grid_columnconfigure(1, weight=1, uniform="mdl_btn2")
+            self.opt_model.grid(row=0, column=0, columnspan=2, padx=0, pady=(2, 4), sticky="ew")
+            self.btn_load_model.grid(row=1, column=0, padx=2, pady=2, sticky="ew")
+            self.btn_unload_model.grid(row=1, column=1, padx=2, pady=2, sticky="ew")
+            self.btn_add_local_dir.grid(row=2, column=0, padx=2, pady=2, sticky="ew")
+            self.btn_add_local_file.grid(row=2, column=1, padx=2, pady=2, sticky="ew")
+
+    def _reflow_presets_and_header(self, avail_w: int):
+        """Adapta las barras superiores de título y presets cuando el ancho de la ventana es reducido."""
+        hdr_mode = "inline" if avail_w >= 620 else "stacked"
+        if self._header_row_mode != hdr_mode:
+            self._header_row_mode = hdr_mode
+            self.lbl_title.grid_forget()
+            self.lbl_ram.grid_forget()
+            self.lbl_models_header.grid_forget()
+            self.lbl_loaded_model.grid_forget()
+            if hdr_mode == "inline":
+                self.lbl_title.grid(row=0, column=0, sticky="w")
+                self.lbl_ram.grid(row=0, column=1, pady=(4, 0), sticky="e")
+                self.lbl_models_header.grid(row=0, column=0, sticky="ew")
+                self.lbl_loaded_model.grid(row=0, column=1, padx=(8, 0), sticky="e")
+            else:
+                self.lbl_title.grid(row=0, column=0, columnspan=2, sticky="w")
+                self.lbl_ram.grid(row=1, column=0, columnspan=2, pady=(2, 0), sticky="w")
+                self.lbl_models_header.grid(row=0, column=0, columnspan=2, sticky="ew")
+                self.lbl_loaded_model.grid(row=1, column=0, columnspan=2, pady=(2, 0), sticky="w")
+
+        pr_mode = "inline" if avail_w >= 540 else "stacked"
+        if self._presets_row_mode != pr_mode:
+            self._presets_row_mode = pr_mode
+            self.lbl_mode_title.grid_forget()
+            self.frame_preset_btns.grid_forget()
+            if pr_mode == "inline":
+                self.lbl_mode_title.grid(row=0, column=0, padx=(2, 6), pady=2, sticky="w")
+                self.frame_preset_btns.grid(row=0, column=1, sticky="e")
+                for c in range(3):
+                    self.frame_preset_btns.grid_columnconfigure(c, weight=0, uniform="")
+            else:
+                self.lbl_mode_title.grid(row=0, column=0, columnspan=2, padx=2, pady=(2, 2), sticky="w")
+                self.frame_preset_btns.grid(row=1, column=0, columnspan=2, sticky="ew")
+                for c in range(3):
+                    self.frame_preset_btns.grid_columnconfigure(c, weight=1, uniform="prs_btn")
 
     def _build_bottom_bar(self):
         self.frame_bottom = ctk.CTkFrame(self, fg_color="transparent")
@@ -541,17 +838,23 @@ class TTSApp(ctk.CTk):
 
     def _on_window_resize(self, event):
         if event.widget == self:
-            new_w = max(460, event.width - 75)
-            if abs(new_w - self._last_wrap_w) < 12:
+            new_w = max(360, event.width - 65)
+            if abs(new_w - self._last_wrap_w) < 10:
                 return
             self._last_wrap_w = new_w
             try:
+                self._reflow_models_row(new_w)
+                self._reflow_presets_and_header(new_w)
                 self.status_lbl.configure(wraplength=new_w)
                 self.lbl_ux_hint.configure(wraplength=new_w - 15)
                 self.lbl_voice.configure(wraplength=new_w - 40)
                 self.lbl_mode_desc.configure(wraplength=new_w - 40)
-                self.lbl_models_header.configure(wraplength=max(320, int(new_w * 0.58)))
-                self.lbl_loaded_model.configure(wraplength=max(200, int(new_w * 0.38)))
+                if new_w >= 620:
+                    self.lbl_models_header.configure(wraplength=max(300, int(new_w * 0.58)))
+                    self.lbl_loaded_model.configure(wraplength=max(180, int(new_w * 0.38)))
+                else:
+                    self.lbl_models_header.configure(wraplength=new_w - 20)
+                    self.lbl_loaded_model.configure(wraplength=new_w - 20)
             except Exception:
                 pass
 

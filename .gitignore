@@ -1,15 +1,13 @@
 .venv/
+venv/
 backend/venv/
 frontend/venv/
-backend.log
-test.log
-backend/models/
-backend/reference_preview.wav
-test_deps.py
 
 __pycache__/
-*.pyc
-ui.log
-backend/output_audio.wav
-backend/reference_preview.wav
-frontend/resultado.wav
+*.py[cod]
+*.log
+test_deps.py
+backend/get-pip.py
+backend/models/
+*.wav
+!backend/reference_audio/*.wav

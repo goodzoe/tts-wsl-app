@@ -1,13 +1,13 @@
-"""Controlador de reproducción de audio con soporte WSLg PulseAudio y pausa instantánea (buffer=256)."""
+"""Controlador de reproducción de audio multiplataforma con liberación segura de descriptores WAV."""
 
 import os
 import sys
 import glob
 import time
+import wave
 import ctypes
 import platform
 
-# Configurar PulseAudio de WSLg antes de importar pygame para evitar errores de ALSA card 0
 if platform.system() == "Linux" and os.path.exists("/mnt/wslg/PulseServer"):
     os.environ.setdefault("PULSE_SERVER", "unix:/mnt/wslg/PulseServer")
     os.environ.setdefault("SDL_AUDIODRIVER", "pulseaudio")
@@ -30,7 +30,7 @@ if platform.system() == "Linux" and os.path.exists("/mnt/wslg/PulseServer"):
                                 os.symlink(os.path.basename(target), link_path)
                             except OSError:
                                 pass
-                        target = link_path
+                            target = link_path
                     try:
                         ctypes.CDLL(target, mode=ctypes.RTLD_GLOBAL)
                     except OSError:
@@ -40,7 +40,7 @@ import pygame
 
 
 class AudioPlayerController:
-    """Encapsula pygame.mixer con corte inmediato de buffer para pausar/buscar sin retraso."""
+    """Encapsula pygame.mixer con liberación explícita de archivos para evitar bloqueos en Windows."""
 
     def __init__(self):
         self.mixer_ready = False
@@ -52,6 +52,7 @@ class AudioPlayerController:
         self.play_start_wall = 0.0
         self.play_offset = 0.0
         self.current_file = ""
+        self.current_mtime = 0.0
         self.init_mixer()
 
     def init_mixer(self) -> bool:
@@ -65,19 +66,67 @@ class AudioPlayerController:
             self.mixer_ready = False
         return self.mixer_ready
 
-    def load_file(self, filepath: str) -> bool:
+    @staticmethod
+    def _get_wav_duration(filepath: str) -> float:
+        """Calcula la duración leyendo únicamente la cabecera WAV sin duplicar el buffer en RAM."""
+        try:
+            with wave.open(filepath, "rb") as wf:
+                frames = wf.getnframes()
+                rate = wf.getframerate()
+                if rate > 0:
+                    return max(0.1, float(frames) / float(rate))
+        except Exception:
+            pass
+        snd = pygame.mixer.Sound(filepath)
+        return max(0.1, float(snd.get_length()))
+
+    def stop(self) -> None:
+        """Detiene la reproducción actual, reinicia la posición y libera el archivo WAV en el mixer."""
+        if self.mixer_ready:
+            try:
+                pygame.mixer.music.stop()
+                if hasattr(pygame.mixer.music, "unload"):
+                    pygame.mixer.music.unload()
+            except Exception:
+                pass
+        self.is_playing = False
+        self.is_paused = False
+        self.play_offset = 0.0
+        self.current_file = ""
+        self.current_mtime = 0.0
+
+    def release_file(self) -> None:
+        """Alias compatible con stop(): detiene y descarga el archivo actual del mixer."""
+        self.stop()
+
+    def pause(self) -> None:
+        """Pausa la reproducción actual conservando la posición exacta."""
+        if not self.mixer_ready or not self.is_playing or self.is_paused:
+            return
+        try:
+            exact_pos = self.get_current_pos()
+            pygame.mixer.music.stop()
+            self.play_offset = exact_pos
+            self.is_paused = True
+        except Exception:
+            pass
+
+    def load_file(self, filepath: str, preserve_offset: bool = False) -> bool:
         if not self.mixer_ready and not self.init_mixer():
             return False
         if not os.path.exists(filepath):
             return False
         try:
-            if self.is_playing:
-                pygame.mixer.music.stop()
-            snd = pygame.mixer.Sound(filepath)
-            self.audio_duration = max(0.1, float(snd.get_length()))
+            saved_offset = self.play_offset if preserve_offset else 0.0
+            self.stop()
+            self.audio_duration = self._get_wav_duration(filepath)
             pygame.mixer.music.load(filepath)
             self.current_file = filepath
-            self.play_offset = 0.0
+            try:
+                self.current_mtime = os.path.getmtime(filepath)
+            except OSError:
+                self.current_mtime = time.time()
+            self.play_offset = min(saved_offset, max(0.0, self.audio_duration - 0.05))
             self.is_playing = False
             self.is_paused = False
             return True
@@ -89,16 +138,28 @@ class AudioPlayerController:
         if not self.is_playing or self.is_paused:
             return self.play_offset
         elapsed = time.time() - self.play_start_wall
-        return min(self.audio_duration, self.play_offset + elapsed)
+        pos = min(self.audio_duration, self.play_offset + elapsed)
+        if pos >= self.audio_duration - 0.05:
+            self.is_playing = False
+            self.is_paused = False
+            self.play_offset = self.audio_duration
+        return pos
 
     def toggle_play_pause(self, filepath: str) -> str:
-        """Alterna Play/Pause con vaciado inmediato de buffer. Retorna 'playing', 'paused' o 'error'."""
+        """Alterna Play/Pause liberando o recargando de forma segura. Retorna 'playing', 'paused' o 'error'."""
         if not self.mixer_ready and not self.init_mixer():
             return "no_device"
         if not os.path.exists(filepath):
             return "no_file"
-        if self.audio_duration <= 0.1 or self.current_file != filepath:
-            if not self.load_file(filepath):
+
+        try:
+            file_mtime = os.path.getmtime(filepath)
+        except OSError:
+            file_mtime = 0.0
+
+        file_changed = abs(file_mtime - self.current_mtime) > 1e-3 if self.current_mtime > 0 else False
+        if self.audio_duration <= 0.1 or self.current_file != filepath or file_changed:
+            if not self.load_file(filepath, preserve_offset=not file_changed):
                 return "error"
 
         try:
@@ -149,13 +210,3 @@ class AudioPlayerController:
 
     def is_busy(self) -> bool:
         return bool(self.mixer_ready and pygame.mixer.music.get_busy())
-
-    def stop(self) -> None:
-        if self.mixer_ready:
-            try:
-                pygame.mixer.music.stop()
-            except Exception:
-                pass
-        self.is_playing = False
-        self.is_paused = False
-        self.play_offset = 0.0

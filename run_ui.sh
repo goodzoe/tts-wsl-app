@@ -1,27 +1,32 @@
-#!/bin/bash
-echo "Iniciando la Interfaz UI del TTS LatAm..."
-cd "$(dirname "$0")/frontend" || exit 1
+#!/usr/bin/env bash
+set -euo pipefail
 
-if [ ! -d "venv" ]; then
-    python3 -m venv --system-site-packages venv
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT_DIR/frontend"
+
+if [ -x "$ROOT_DIR/backend/venv/bin/python3" ]; then
+    VENV_DIR="$ROOT_DIR/backend/venv"
+else
+    VENV_DIR="$ROOT_DIR/frontend/venv"
+    if [ ! -d "$VENV_DIR" ]; then
+        python3 -m venv --system-site-packages "$VENV_DIR"
+    fi
+    if [ ! -f "$VENV_DIR/.deps_installed" ]; then
+        "$VENV_DIR/bin/pip" install -q customtkinter requests pygame
+        touch "$VENV_DIR/.deps_installed"
+    fi
 fi
 
-if [ ! -f "venv/.deps_installed" ]; then
-    ./venv/bin/pip install -q customtkinter requests pygame
-    touch venv/.deps_installed
-fi
-
-# Configurar audio WSLg (PulseAudio) para evitar errores ALSA card 0
 if [ -S "/mnt/wslg/PulseServer" ]; then
     export PULSE_SERVER="unix:/mnt/wslg/PulseServer"
     export SDL_AUDIODRIVER="pulseaudio"
+    export DISPLAY="${DISPLAY:-:0}"
+    export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
 fi
 
-PYGAME_LIBS="$(pwd)/venv/lib/python3.12/site-packages/pygame.libs"
-if [ -d "$PYGAME_LIBS" ]; then
-    export LD_LIBRARY_PATH="$PYGAME_LIBS:${LD_LIBRARY_PATH:-}"
+PYGAME_LIBS="$("$VENV_DIR/bin/python3" -c 'import os, pygame; print(os.path.join(os.path.dirname(pygame.__file__), "..", "pygame.libs"))' 2>/dev/null || true)"
+if [ -n "$PYGAME_LIBS" ] && [ -d "$PYGAME_LIBS" ]; then
+    export LD_LIBRARY_PATH="$(cd "$PYGAME_LIBS" && pwd):${LD_LIBRARY_PATH:-}"
 fi
 
-export DISPLAY="${DISPLAY:-:0}"
-export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
-exec ./venv/bin/python3 main.py
+exec "$VENV_DIR/bin/python3" main.py

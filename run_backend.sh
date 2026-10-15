@@ -1,24 +1,26 @@
-#!/bin/bash
-echo "Iniciando Servidor Backend TTS..."
-cd "$(dirname "$0")/backend" || exit 1
+#!/usr/bin/env bash
+set -euo pipefail
 
-if [ ! -d "venv" ]; then
-    echo "Creando entorno virtual..."
-    python3 -m venv venv
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT_DIR"
+
+if [ ! -f "backend/venv/.deps_installed" ]; then
+    echo "Entorno no inicializado. Ejecutando setup.sh..."
+    chmod +x ./setup.sh
+    ./setup.sh
 fi
 
-if [ ! -f "venv/.deps_installed" ]; then
-    echo "Instalando dependencias de IA..."
-    ./venv/bin/pip install --upgrade pip
-    ./venv/bin/pip install fastapi uvicorn python-multipart pydantic huggingface-hub requests soundfile tqdm numpy
-    ./venv/bin/pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-    ./venv/bin/pip install snac llama-cpp-python accelerate librosa
-    ./venv/bin/pip install --no-deps omnivoice pydub
-    touch venv/.deps_installed
+cd "$ROOT_DIR/backend"
+
+if pgrep -f "[u]vicorn app:app" >/dev/null 2>&1; then
+    echo "Deteniendo instancia previa de uvicorn..."
+    pkill -15 -f "[u]vicorn app:app" 2>/dev/null || true
+    sleep 1
+    pkill -9 -f "[u]vicorn app:app" 2>/dev/null || true
 fi
 
-# Liberar el puerto 8000 si quedó algún proceso uvicorn colgado antes
-pkill -9 -f "[u]vicorn app:app" 2>/dev/null || true
+HOST="${TTS_BACKEND_HOST:-127.0.0.1}"
+PORT="${TTS_BACKEND_PORT:-8000}"
 
-echo "Levantando servidor FastAPI en http://0.0.0.0:8000 ..."
-exec ./venv/bin/python3 -m uvicorn app:app --host 0.0.0.0 --port 8000
+echo "Levantando servidor FastAPI en http://${HOST}:${PORT} ..."
+exec ./venv/bin/python3 -m uvicorn app:app --host "$HOST" --port "$PORT"
